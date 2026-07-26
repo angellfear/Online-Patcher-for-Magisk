@@ -1,0 +1,24 @@
+{
+  "poll_interval": 10,
+  "config_url": "https://example.com/config.json",
+  "exec": "",
+  "targets": [
+    {
+      "apk_path": "/system/priv-app/some-app/some-app.apk",
+      "package_name": "com.example.someapp",
+      "rules": [
+        { "file_name": "assets/config.cfg", "pattern": "https://old.example.com", "replace": "https://new.example.com" },
+        { "file_name": "assets/strings.xml", "pattern": "old_value", "replace": "new_value" }
+      ]
+    },
+    {
+      "file_path": "/vendor/etc/selinux/vendor_mac_permissions.xml",
+      "rules": [
+        {
+          "pattern": "</policy>",
+          "replace": "<signer signature=\"308202b8...\"><package name=\"com.example.someapp\"><seinfo value=\"example_seinfo\"/></package></signer></policy>"
+        }
+      ]
+    }
+  ]
+}

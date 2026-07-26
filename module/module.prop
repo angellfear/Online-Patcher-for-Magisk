@@ -1,0 +1,6 @@
+id=online_patcher
+name=Online Patcher for Magisk
+version=1.0
+versionCode=1
+author=angellfear
+description=Config-driven patcher: patches APK(s) and/or plain files per a remote JSON config, survives reboots/OTA, offline-restores from local cache before network is up
