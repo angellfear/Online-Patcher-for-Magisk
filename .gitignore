@@ -1,2 +1,4 @@
 out/
 .claude/
+.playwright-mcp/
+device_page/
