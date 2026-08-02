@@ -108,13 +108,34 @@ if (Test-Path $configUrlSrc) {
 Write-Host "✓ Module assembled at $moduleOut" -ForegroundColor Green
 
 # --- Package ZIP ---
+# NOTE: do NOT use Compress-Archive here. On Windows PowerShell it writes ZIP
+# entry names with backslashes ("bin\patcher"), which is not valid ZIP (spec
+# requires forward slashes). Android's unzip then extracts a single file
+# literally named "bin\patcher" at the module root instead of bin/patcher in a
+# bin/ directory - so post-fs-data.sh/service.sh never find the binary and the
+# patcher silently never runs. Build the archive manually with forward-slash
+# entry names via System.IO.Compression to guarantee correct paths.
 if (-not $SkipZip) {
     Write-Host "`nPackaging ZIP..." -ForegroundColor Yellow
     $zipPath = Join-Path $outDir "online_patcher.zip"
     if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 
-    Compress-Archive -Path (Join-Path $moduleOut "*") -DestinationPath $zipPath -Force
-    Write-Host "✓ Packaged: $zipPath" -ForegroundColor Green
+    Add-Type -AssemblyName System.IO.Compression | Out-Null
+    Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+
+    $zip = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $base = (Resolve-Path $moduleOut).Path.TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
+        Get-ChildItem -Path $moduleOut -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring($base.Length).Replace('\', '/')
+            [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $zip, $_.FullName, $rel,
+                [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
+        }
+    } finally {
+        $zip.Dispose()
+    }
+    Write-Host "✓ Packaged: $zipPath (forward-slash paths)" -ForegroundColor Green
 }
 
 Write-Host "`n==== Build complete ====" -ForegroundColor Cyan
