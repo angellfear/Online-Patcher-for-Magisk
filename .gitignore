@@ -2,3 +2,7 @@ out/
 .claude/
 .playwright-mcp/
 device_page/
+
+# Your real config server URL - never commit it. Copy config_url.txt.example
+# to config_url.txt and put your own URL there.
+config_url.txt

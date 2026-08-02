@@ -84,7 +84,15 @@ Copy-Item (Join-Path $root "module\customize.sh") $moduleOut -Force
 
 # Ship the config server URL: config_url.txt in the repo root becomes the
 # module's "config_url" file (the exact name the binary reads next to itself).
+# config_url.txt is gitignored (holds your real server); if it's absent (fresh
+# clone) fall back to the committed placeholder in config_url.txt.example.
 $configUrlSrc = Join-Path $root "config_url.txt"
+if (-not (Test-Path $configUrlSrc)) {
+    $configUrlSrc = Join-Path $root "config_url.txt.example"
+    if (Test-Path $configUrlSrc) {
+        Write-Host "! config_url.txt not found - using config_url.txt.example (placeholder URL)" -ForegroundColor Yellow
+    }
+}
 if (Test-Path $configUrlSrc) {
     $url = (Get-Content $configUrlSrc -Raw).Trim()
     if ($url) {
