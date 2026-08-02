@@ -1,0 +1,27 @@
+- generic [ref=e2]:
+  - navigation [ref=e3]:
+    - list [ref=e4]:
+      - listitem [ref=e5]:
+        - generic [ref=e6]: "eMMC: Samsung BJTD4R, 29.12 GB"
+      - listitem [ref=e7]:
+        - combobox [ref=e8]:
+          - option "400 kHz"
+          - option "1 MHz"
+          - option "5 MHz"
+          - option "10 MHz"
+          - option "20 MHz"
+          - option "26 MHz"
+          - option "40 MHz"
+          - option "52 MHz"
+          - option "80 MHz" [selected]
+      - listitem [ref=e9]:
+        - button "Release CPU" [ref=e10] [cursor=pointer]
+      - listitem [ref=e11]: "|"
+      - listitem [ref=e12]:
+        - generic [ref=e13]: "UART: 921600"
+    - list [ref=e14]:
+      - listitem
+      - listitem
+      - listitem [ref=e15]:
+        - generic [ref=e16]: ●
+  - list [ref=e17]

@@ -81,6 +81,22 @@ Copy-Item (Join-Path $root "module\post-fs-data.sh") $moduleOut -Force
 Copy-Item (Join-Path $root "module\service.sh") $moduleOut -Force
 Copy-Item (Join-Path $root "module\sepolicy.rule") $moduleOut -Force
 Copy-Item (Join-Path $root "module\customize.sh") $moduleOut -Force
+
+# Ship the config server URL: config_url.txt in the repo root becomes the
+# module's "config_url" file (the exact name the binary reads next to itself).
+$configUrlSrc = Join-Path $root "config_url.txt"
+if (Test-Path $configUrlSrc) {
+    $url = (Get-Content $configUrlSrc -Raw).Trim()
+    if ($url) {
+        Set-Content -Path (Join-Path $moduleOut "config_url") -Value $url -NoNewline -Encoding ascii
+        Write-Host "✓ config_url set to: $url" -ForegroundColor Green
+    } else {
+        Write-Host "! config_url.txt is empty - module will ship without a server URL" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "! config_url.txt not found - module will ship without a server URL" -ForegroundColor Yellow
+}
+
 Write-Host "✓ Module assembled at $moduleOut" -ForegroundColor Green
 
 # --- Package ZIP ---
