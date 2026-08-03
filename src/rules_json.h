@@ -17,7 +17,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_RULES 64
 #define MAX_TARGETS 8
 
 /* pattern/replace can each be given as a plain JSON string OR as a
@@ -41,9 +40,13 @@ typedef struct {
     char replace_file[512];
 } patch_rule_t;
 
+/* rules is grown dynamically (no fixed cap) - a config may carry as many
+   rules per target as it likes. Owned by the rule_set_t; freed via
+   free_patch_config(). */
 typedef struct {
-    patch_rule_t rules[MAX_RULES];
+    patch_rule_t *rules;
     int count;
+    int cap;
 } rule_set_t;
 
 static const char *json_skip_ws(const char *p) {
@@ -143,7 +146,9 @@ static const char *json_parse_rule_object(const char *p, patch_rule_t *rule) {
    Returns a pointer just past the closing ']' (rs->count may be 0 for an
    empty array), or NULL on malformed input. */
 static const char *json_parse_rules_array(const char *p, rule_set_t *rs) {
+    rs->rules = NULL;
     rs->count = 0;
+    rs->cap = 0;
     p = json_skip_ws(p);
     if (*p != '[') return NULL;
     p++;
@@ -152,7 +157,13 @@ static const char *json_parse_rules_array(const char *p, rule_set_t *rs) {
         p = json_skip_ws(p);
         if (*p == ']') return p + 1;
 
-        if (rs->count >= MAX_RULES) return NULL;
+        if (rs->count >= rs->cap) {
+            int newcap = rs->cap ? rs->cap * 2 : 8;
+            patch_rule_t *nr = (patch_rule_t *)realloc(rs->rules, (size_t)newcap * sizeof(patch_rule_t));
+            if (!nr) return NULL;
+            rs->rules = nr;
+            rs->cap = newcap;
+        }
         p = json_parse_rule_object(p, &rs->rules[rs->count]);
         if (!p) return NULL;
         rs->count++;
@@ -296,4 +307,18 @@ static int parse_patch_config(const char *json, patch_config_t *cfg) {
     }
 
     return 0;
+}
+
+/* Frees the per-target dynamically-grown rule arrays. Safe to call on a
+   cfg that was memset to zero and/or only partially parsed (each target's
+   rules pointer is NULL until its rules array is allocated), so it also
+   cleans up after a mid-parse failure. Does not free cfg itself. */
+static void free_patch_config(patch_config_t *cfg) {
+    if (!cfg) return;
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        free(cfg->targets[i].rules.rules);
+        cfg->targets[i].rules.rules = NULL;
+        cfg->targets[i].rules.count = 0;
+        cfg->targets[i].rules.cap = 0;
+    }
 }

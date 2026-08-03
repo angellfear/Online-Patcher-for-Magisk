@@ -42,6 +42,14 @@
 #include <signal.h>
 #include <sys/file.h>
 #include <fcntl.h>
+#include <sched.h>
+#include <sys/syscall.h>
+
+/* bionic's sched.h does not expose setns() even though the syscall is
+   available on the Android API level used by this binary. */
+static int enter_mount_namespace(int nsfd) {
+    return (int)syscall(__NR_setns, nsfd, CLONE_NEWNS);
+}
 
 #include "sha1.h"
 #include "bignum.h"
@@ -841,7 +849,99 @@ static void cb_mount(const char *path, void *ctx) {
 }
 
 static int mount_over_all_copies(const char *source, const char *system_path, const char *package_name) {
-    return for_each_apk_copy(system_path, package_name, cb_mount, (void *)source);
+    int count = for_each_apk_copy(system_path, package_name, cb_mount, (void *)source);
+
+    /* Android gives zygote-launched apps their own mount namespace. A bind
+       mount made only in the Magisk daemon's namespace is therefore invisible
+       to the app, even though mount() succeeds. Put the same mount in every
+       relevant zygote/app namespace as well. */
+    if (package_name && package_name[0]) {
+        DIR *proc = opendir("/proc");
+        if (proc) {
+            struct dirent *ent;
+            ino_t seen[32];
+            int seen_count = 0;
+            while ((ent = readdir(proc)) != NULL) {
+                if (ent->d_name[0] < '0' || ent->d_name[0] > '9') continue;
+
+                char procfile[128], name[256];
+                snprintf(procfile, sizeof(procfile), "/proc/%s/cmdline", ent->d_name);
+                FILE *pf = fopen(procfile, "r");
+                if (!pf) continue;
+                size_t n = fread(name, 1, sizeof(name) - 1, pf);
+                fclose(pf);
+                if (n == 0) continue;
+                name[n] = 0;
+
+                int relevant = !strcmp(name, "zygote") || !strcmp(name, "zygote64") ||
+                               !strncmp(name, package_name, strlen(package_name));
+                if (!relevant) continue;
+
+                snprintf(procfile, sizeof(procfile), "/proc/%s/ns/mnt", ent->d_name);
+                struct stat nsst;
+                if (stat(procfile, &nsst) != 0) continue;
+                int duplicate = 0;
+                for (int i = 0; i < seen_count; i++) {
+                    if (seen[i] == nsst.st_ino) { duplicate = 1; break; }
+                }
+                if (duplicate || seen_count >= (int)(sizeof(seen) / sizeof(seen[0]))) continue;
+                seen[seen_count++] = nsst.st_ino;
+
+                int nsfd = open(procfile, O_RDONLY);
+                int selfns = open("/proc/self/ns/mnt", O_RDONLY);
+                if (nsfd < 0 || selfns < 0) {
+                    if (nsfd >= 0) close(nsfd);
+                    if (selfns >= 0) close(selfns);
+                    continue;
+                }
+                if (enter_mount_namespace(nsfd) == 0) {
+                    int mounted = for_each_apk_copy(system_path, package_name, cb_mount, (void *)source);
+                    count += mounted;
+                    logmsg("mounted in namespace of %s (pid %s): %d mount(s)", name, ent->d_name, mounted);
+                    if (enter_mount_namespace(selfns) != 0) {
+                        logmsg("cannot restore mount namespace after pid %s: %s", ent->d_name, strerror(errno));
+                    }
+                } else {
+                    logmsg("cannot enter mount namespace of pid %s: %s", ent->d_name, strerror(errno));
+                }
+                close(nsfd);
+                close(selfns);
+            }
+            closedir(proc);
+        }
+    }
+    return count;
+}
+
+/* A bind mount can disappear without the config changing (for example when
+   Android recreates an isolated mount namespace).  The config fast path must
+   not make that loss permanent: restore cached mounts before deciding that
+   there is nothing new to process. */
+static void ensure_cached_mounts(const char *cache_index_path) {
+    cache_index_t idx;
+    if (cache_index_load(cache_index_path, &idx) != 0) return;
+
+    for (int i = 0; i < idx.count; i++) {
+        const cache_entry_t *e = &idx.entries[i];
+        struct stat source_st, target_st;
+        int mounted = stat(e->patched_path, &source_st) == 0 &&
+                      stat(e->name, &target_st) == 0 &&
+                      source_st.st_dev == target_st.st_dev &&
+                      source_st.st_ino == target_st.st_ino;
+        if (mounted) continue;
+
+        char current_hex[41];
+        if (content_fingerprint(e->name, current_hex) != 0 ||
+            strcmp(current_hex, e->orig) != 0) {
+            logmsg("cached mount missing but original changed, not restoring: %s", e->name);
+            continue;
+        }
+
+        umount2(e->name, MNT_DETACH);
+        int mounts = mount_over_all_copies(e->patched_path, e->name, e->package_name);
+        logmsg("restored lost cached mount: %s (%d mount(s))", e->name, mounts);
+        if (mounts > 0) restart_app(e->package_name);
+    }
 }
 
 static void cb_unmount(const char *path, void *ctx) {
@@ -855,7 +955,65 @@ static void cb_unmount(const char *path, void *ctx) {
    mount(s) - the underlying /system file was never modified, so this alone
    is enough. */
 static int unmount_all_copies(const char *system_path, const char *package_name) {
-    return for_each_apk_copy(system_path, package_name, cb_unmount, NULL);
+    int count = for_each_apk_copy(system_path, package_name, cb_unmount, NULL);
+
+    /* The corresponding bind mounts may also live in zygote/app namespaces;
+       remove them there so manual revert and config-driven revert are real
+       reverts from the application's point of view. */
+    if (package_name && package_name[0]) {
+        DIR *proc = opendir("/proc");
+        if (proc) {
+            struct dirent *ent;
+            ino_t seen[32];
+            int seen_count = 0;
+            while ((ent = readdir(proc)) != NULL) {
+                if (ent->d_name[0] < '0' || ent->d_name[0] > '9') continue;
+
+                char procfile[128], name[256];
+                snprintf(procfile, sizeof(procfile), "/proc/%s/cmdline", ent->d_name);
+                FILE *pf = fopen(procfile, "r");
+                if (!pf) continue;
+                size_t n = fread(name, 1, sizeof(name) - 1, pf);
+                fclose(pf);
+                if (n == 0) continue;
+                name[n] = 0;
+
+                int relevant = !strcmp(name, "zygote") || !strcmp(name, "zygote64") ||
+                               !strncmp(name, package_name, strlen(package_name));
+                if (!relevant) continue;
+
+                snprintf(procfile, sizeof(procfile), "/proc/%s/ns/mnt", ent->d_name);
+                struct stat nsst;
+                if (stat(procfile, &nsst) != 0) continue;
+                int duplicate = 0;
+                for (int i = 0; i < seen_count; i++) {
+                    if (seen[i] == nsst.st_ino) { duplicate = 1; break; }
+                }
+                if (duplicate || seen_count >= (int)(sizeof(seen) / sizeof(seen[0]))) continue;
+                seen[seen_count++] = nsst.st_ino;
+
+                int nsfd = open(procfile, O_RDONLY);
+                int selfns = open("/proc/self/ns/mnt", O_RDONLY);
+                if (nsfd < 0 || selfns < 0) {
+                    if (nsfd >= 0) close(nsfd);
+                    if (selfns >= 0) close(selfns);
+                    continue;
+                }
+                if (enter_mount_namespace(nsfd) == 0) {
+                    count += for_each_apk_copy(system_path, package_name, cb_unmount, NULL);
+                    if (enter_mount_namespace(selfns) != 0) {
+                        logmsg("cannot restore mount namespace after revert pid %s: %s", ent->d_name, strerror(errno));
+                    }
+                } else {
+                    logmsg("cannot enter mount namespace for revert pid %s: %s", ent->d_name, strerror(errno));
+                }
+                close(nsfd);
+                close(selfns);
+            }
+            closedir(proc);
+        }
+    }
+    return count;
 }
 
 /* ---- LED ring notifications ----
@@ -1008,20 +1166,26 @@ static void target_content_hash(const target_config_t *t, char *hex_out) {
         const patch_rule_t *r = &t->rules.rules[i];
         sha1_update(&ctx, (const unsigned char *)r->file_name, strlen(r->file_name));
         sha1_update(&ctx, (const unsigned char *)r->pattern, strlen(r->pattern));
+        sha1_update(&ctx, (const unsigned char *)r->pattern_hex, strlen(r->pattern_hex));
         sha1_update(&ctx, (const unsigned char *)r->replace, strlen(r->replace));
+        sha1_update(&ctx, (const unsigned char *)r->replace_hex, strlen(r->replace_hex));
+        sha1_update(&ctx, (const unsigned char *)r->replace_file, strlen(r->replace_file));
     }
     unsigned char digest[20];
     sha1_final(&ctx, digest);
     for (int i = 0; i < 20; i++) snprintf(hex_out + i * 2, 3, "%02x", digest[i]);
 }
 
-/* Full extract/patch/sign/repack/mount/restart pipeline for one target.
+/* Full extract/patch/sign/repack/mount pipeline for one target.
    Rebuilds only if (apk, target-content) isn't already in the cache index
-   for this target; mounts either way; restarts the app only when a real
-   rebuild just happened. LED-pulses at start/success/failure (see notify_*
-   above) since this device shows nothing for standard Android notifications. */
-static void process_target(const char *work_dir, const char *cache_index_path,
-                            const char *base_patched_out, const target_config_t *tgt) {
+   for this target; mounts either way. Returns 1 when this target was really
+   rebuilt and successfully mounted, otherwise 0. The caller restarts apps
+   only after every target has been processed, so a runtime file target can
+   be applied before the APK process is restarted. LED-pulses at
+   start/success/failure (see notify_* above) since this device shows nothing
+   for standard Android notifications. */
+static int process_target(const char *work_dir, const char *cache_index_path,
+                          const char *base_patched_out, const target_config_t *tgt) {
     char cfg_hex[41];
     target_content_hash(tgt, cfg_hex);
     const char *target_apk = tgt->apk_path;
@@ -1037,7 +1201,7 @@ static void process_target(const char *work_dir, const char *cache_index_path,
 
     if (tgt->rules.count == 0) {
         logmsg("target %s: no rules, nothing to do", target_apk);
-        return;
+        return 0;
     }
 
     char patched_out[600];
@@ -1055,7 +1219,7 @@ static void process_target(const char *work_dir, const char *cache_index_path,
     char apk_hex[41];
     if (content_fingerprint(target_apk, apk_hex) != 0) {
         logmsg("cannot read target apk: %s", target_apk);
-        return;
+        return 0;
     }
 
     cache_index_t idx1;
@@ -1085,7 +1249,7 @@ static void process_target(const char *work_dir, const char *cache_index_path,
                 logmsg("cannot read target file: %s", target_apk);
                 led_stop_patching_blink(blink_pid);
                 led_show_result(0);
-                return;
+                return 0;
             }
             int wr_ok = (write_whole_file(patched_out, data, flen) == 0);
             free(data);
@@ -1093,7 +1257,7 @@ static void process_target(const char *work_dir, const char *cache_index_path,
                 logmsg("cannot write patched file: %s", patched_out);
                 led_stop_patching_blink(blink_pid);
                 led_show_result(0);
-                return;
+                return 0;
             }
 
             char basename[256];
@@ -1107,7 +1271,7 @@ static void process_target(const char *work_dir, const char *cache_index_path,
                 logmsg("rules present but nothing matched, nothing to mount");
                 led_stop_patching_blink(blink_pid);
                 led_show_result(0);
-                return;
+                return 0;
             }
             logmsg("patched plain file: %s", target_apk);
             goto rebuild_done;
@@ -1122,7 +1286,7 @@ static void process_target(const char *work_dir, const char *cache_index_path,
             logmsg("extract failed");
             led_stop_patching_blink(blink_pid);
             led_show_result(0);
-            return;
+            return 0;
         }
         logmsg("APK extracted");
 
@@ -1140,7 +1304,7 @@ static void process_target(const char *work_dir, const char *cache_index_path,
             logmsg("rules present but nothing matched, nothing to mount");
             led_stop_patching_blink(blink_pid);
             led_show_result(0);
-            return;
+            return 0;
         }
 
     /* remove old META-INF */
@@ -1359,7 +1523,7 @@ static void process_target(const char *work_dir, const char *cache_index_path,
         logmsg("cannot open output apk");
         led_stop_patching_blink(blink_pid);
         led_show_result(0);
-        return;
+        return 0;
     }
 
     typedef struct { char name[512]; uint32_t crc; uint32_t size; uint32_t offset; } cdent_t;
@@ -1474,10 +1638,8 @@ rebuild_done:
 
         if (rebuilt) {
             led_show_result(mounted > 0);
-            if (mounted > 0) {
-                restart_app(package_name);
-            }
         }
+        return rebuilt && mounted > 0;
     }
 }
 
@@ -1503,6 +1665,8 @@ static void run_cycle(const char *work_dir, const char *cache_index_path,
                        const char *patched_out, patcher_state_t *st, int first_cycle) {
     if (first_cycle) {
         phase0_instant_mount(cache_index_path);
+    } else {
+        ensure_cached_mounts(cache_index_path);
     }
 
     /* ---- Phase 1: fetch remote config, patch/mount/revert if it changed ---- */
@@ -1527,11 +1691,12 @@ static void run_cycle(const char *work_dir, const char *cache_index_path,
         return;
     }
 
-    /* patch_config_t is large (MAX_TARGETS * MAX_RULES rules, each with
-       several KB of pattern/replace/hex buffers - multiple MB total) - heap
-       allocate it rather than putting it on the stack, which is a fixed,
-       much smaller budget (this previously crashed with a stack overflow
-       when invoked from certain shell contexts with a tighter rlimit). */
+    /* patch_config_t holds MAX_TARGETS targets; each target's rules are now
+       heap-grown (see rules_json.h), so the struct itself is modest. Still
+       heap-allocate it rather than the stack - historically a fat on-stack
+       copy here overflowed a tight rlimit in some shell contexts, and heap
+       keeps that impossible regardless of future field growth. Rules are
+       freed via free_patch_config() before free(cfg) on every exit path. */
     patch_config_t *cfg = (patch_config_t *)malloc(sizeof(patch_config_t));
     if (!cfg) {
         logmsg("out of memory parsing config");
@@ -1540,6 +1705,7 @@ static void run_cycle(const char *work_dir, const char *cache_index_path,
     }
     if (parse_patch_config(config_text, cfg) != 0) {
         logmsg("received config is not valid JSON, ignoring");
+        free_patch_config(cfg);
         free(cfg);
         free(config_text);
         return;
@@ -1555,9 +1721,12 @@ static void run_cycle(const char *work_dir, const char *cache_index_path,
     }
 
     logmsg("config has %d target(s)", cfg->target_count);
+    int rebuilt_target = 0;
     for (int i = 0; i < cfg->target_count; i++) {
         if (!cfg->targets[i].apk_path[0]) continue;
-        process_target(work_dir, cache_index_path, patched_out, &cfg->targets[i]);
+        if (process_target(work_dir, cache_index_path, patched_out, &cfg->targets[i])) {
+            rebuilt_target = 1;
+        }
     }
 
     /* Revert anything we've previously patched that this config no longer
@@ -1580,6 +1749,24 @@ static void run_cycle(const char *work_dir, const char *cache_index_path,
         }
     }
 
+    /* Restart the affected application only after all targets are mounted.
+       This matters when the APK target is reused from cache but one or more
+       persistent files copied out of that APK were rebuilt in this cycle. */
+    if (rebuilt_target) {
+        for (int i = 0; i < cfg->target_count; i++) {
+            const char *package_name = cfg->targets[i].package_name;
+            if (!package_name[0]) continue;
+            int already_restarted = 0;
+            for (int j = 0; j < i; j++) {
+                if (!strcmp(cfg->targets[j].package_name, package_name)) {
+                    already_restarted = 1;
+                    break;
+                }
+            }
+            if (!already_restarted) restart_app(package_name);
+        }
+    }
+
     if (cfg->exec_cmd[0]) {
         unsigned char eh[20];
         sha1_buf((const unsigned char *)cfg->exec_cmd, strlen(cfg->exec_cmd), eh);
@@ -1592,6 +1779,7 @@ static void run_cycle(const char *work_dir, const char *cache_index_path,
     }
 
     snprintf(st->last_config_hash, sizeof(st->last_config_hash), "%s", cfg_hex);
+    free_patch_config(cfg);
     free(cfg);
     free(config_text);
 }
