@@ -19,12 +19,12 @@ static void bn_from_bytes(bn_t *r, const unsigned char *bytes, int len) {
     memcpy(r->d + (BN_MAX_BYTES - len), bytes, len);
     r->len = BN_MAX_BYTES;
 }
-
+/*
 static int bn_is_zero(const bn_t *a) {
     for (int i = 0; i < BN_MAX_BYTES; i++) if (a->d[i]) return 0;
     return 1;
 }
-
+*/
 /* compare full BN_MAX_BYTES arrays */
 static int bn_cmp(const bn_t *a, const bn_t *b) {
     return memcmp(a->d, b->d, BN_MAX_BYTES);

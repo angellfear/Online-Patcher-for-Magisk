@@ -1127,6 +1127,52 @@ static void phase0_instant_mount(const char *cache_index_path) {
     }
 }
 
+/* At boot the launcher/app process is forked from zygote EARLY - typically
+   before the daemon's first cycle injects our patched-APK mount into zygote's
+   mount namespace. That process therefore loaded the ORIGINAL, unpatched APK,
+   and its resources (e.g. QUASAR_BACKEND) are stale; our later mount only
+   affects processes forked AFTER it. We can't reliably win that fork race, so
+   instead we force-stop each patched APK target's package once, right after
+   phase0 has (re)established the mounts in the zygote namespaces on the first
+   daemon cycle. Android re-forks the app from zygote - which now sees the
+   patched APK - so it comes back patched. This is exactly the manual
+   `am force-stop <pkg>` that was verified to work, done automatically.
+
+   Only packages whose target is actually bind-mounted to our patched file
+   right now are restarted. If a mount was skipped - most importantly when an
+   OTA firmware update changed the original APK out from under a stale cached
+   patch (phase0's orig-hash guard refuses to mount it) - there is nothing
+   patched to reload, so the freshly-booted app is left alone on the new
+   original, and the daemon rebuilds from that new original later. Each
+   package is restarted at most once. */
+static void restart_apps_for_boot_mounts(const char *cache_index_path) {
+    cache_index_t idx;
+    if (cache_index_load(cache_index_path, &idx) != 0) return;
+
+    for (int i = 0; i < idx.count; i++) {
+        const cache_entry_t *e = &idx.entries[i];
+        if (!e->package_name[0]) continue;   /* plain-file target: no app to restart */
+
+        /* Is e->name currently OUR bind mount? (target path resolves to the
+           same dev+inode as the patched source file it's mounted from). */
+        struct stat s_src, s_tgt;
+        if (stat(e->patched_path, &s_src) != 0 || stat(e->name, &s_tgt) != 0) continue;
+        if (s_src.st_dev != s_tgt.st_dev || s_src.st_ino != s_tgt.st_ino) continue;
+
+        /* Don't force-stop the same package twice (a package can have several
+           cached rows, e.g. base.apk plus split/copy paths). */
+        int already = 0;
+        for (int j = 0; j < i; j++) {
+            if (idx.entries[j].package_name[0] &&
+                !strcmp(idx.entries[j].package_name, e->package_name)) { already = 1; break; }
+        }
+        if (already) continue;
+
+        logmsg("boot: reloading %s so it re-forks with the patched APK", e->package_name);
+        restart_app(e->package_name);
+    }
+}
+
 /* Derives a stable, collision-free per-target output path from the CLI's
    base patched_out path: "<dir>/patched_<sha1(target_apk)[:12]>.apk". Needed
    now that a single config can list multiple targets - each needs its own
@@ -1678,6 +1724,23 @@ static void run_cycle(const char *work_dir, const char *cache_index_path,
     if (!config_text) {
         logmsg("nothing to do this cycle (config unavailable)");
         return;
+    }
+
+    /* A successful fetch means the network is up. This is the right moment -
+       and only once per daemon lifetime - to reload the launcher/app that
+       booted off the original (unpatched) APK before our mount reached
+       zygote's namespace. Doing it at the very first cycle (before the network
+       was up) was wrong: the app would restart, fail to reach the redirected
+       backend (no network yet), and latch onto its fallback host - so it must
+       wait until the backend is actually reachable. By now phase0 has the
+       patched APK mounted in zygote, so the re-forked app comes up patched AND
+       can immediately reach the redirected backend. restart_apps_for_boot_
+       mounts() only touches packages whose APK is really mounted, so an
+       OTA-invalidated (unmounted) target is left alone. */
+    static int boot_app_reload_done = 0;
+    if (!boot_app_reload_done) {
+        restart_apps_for_boot_mounts(cache_index_path);
+        boot_app_reload_done = 1;
     }
 
     unsigned char cfg_digest[20];
