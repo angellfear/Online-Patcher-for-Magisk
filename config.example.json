@@ -6,6 +6,8 @@
     {
       "apk_path": "/system/priv-app/some-app/some-app.apk",
       "package_name": "com.example.someapp",
+      "exec_before": "",
+      "exec_after": "rm /data/user/0/com.example.someapp/files/unpacked/*.cfg",
       "rules": [
         { "file_name": "assets/config.cfg", "pattern": "https://old.example.com", "replace": "https://new.example.com" },
         { "file_name": "assets/strings.xml", "pattern": "old_value", "replace": "new_value" }

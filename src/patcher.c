@@ -44,6 +44,8 @@
 #include <fcntl.h>
 #include <sched.h>
 #include <sys/syscall.h>
+#include <sys/xattr.h>
+#include <ftw.h>
 
 /* bionic's sched.h does not expose setns() even though the syscall is
    available on the Android API level used by this binary. */
@@ -61,6 +63,39 @@ static int enter_mount_namespace(int nsfd) {
 #include "patcher_state.h"
 
 static FILE *g_log = NULL;
+static char g_log_path[600];
+
+/* The log is capped at LOG_MAX_BYTES: once it grows past that, everything
+   but the newest LOG_KEEP_BYTES (10%) is dropped, cut at a line boundary.
+   Truncated in place rather than rename()d, so another instance that has
+   the same file open with O_APPEND keeps writing into it. */
+#define LOG_MAX_BYTES (2L * 1024 * 1024)
+#define LOG_KEEP_BYTES (LOG_MAX_BYTES / 10)
+
+static void log_trim_if_needed(void) {
+    if (!g_log || !g_log_path[0]) return;
+    struct stat st;
+    if (fstat(fileno(g_log), &st) != 0 || st.st_size <= LOG_MAX_BYTES) return;
+
+    FILE *r = fopen(g_log_path, "rb");
+    if (!r) return;
+    char *buf = (char *)malloc(LOG_KEEP_BYTES);
+    size_t n = 0;
+    if (buf && fseek(r, -LOG_KEEP_BYTES, SEEK_END) == 0) n = fread(buf, 1, LOG_KEEP_BYTES, r);
+    fclose(r);
+    if (!buf) return;
+
+    /* Skip the (probably partial) first line. */
+    char *nl = (char *)memchr(buf, '\n', n);
+    size_t off = nl ? (size_t)(nl - buf) + 1 : n;
+
+    FILE *w = fopen(g_log_path, "wb");
+    if (w) {
+        fwrite(buf + off, 1, n - off, w);
+        fclose(w);
+    }
+    free(buf);
+}
 
 static void logmsg(const char *fmt, ...) {
     time_t t = time(NULL);
@@ -79,6 +114,7 @@ static void logmsg(const char *fmt, ...) {
     if (g_log) {
         fprintf(g_log, "[%s] %s\n", ts, buf);
         fflush(g_log);
+        log_trim_if_needed();
     }
 }
 
@@ -189,6 +225,47 @@ static int write_whole_file(const char *path, const unsigned char *data, long le
     size_t wr = fwrite(data, 1, len, f);
     fclose(f);
     return (long)wr == len ? 0 : -1;
+}
+
+/* A freshly-written patched file carries the daemon's uid/gid, a default
+   0666-ish mode, and a generic SELinux label - but it is then bind-mounted
+   over the original, so every stat()/getxattr() of the target path suddenly
+   reports *this* file's identity, not the pristine file's. Apps that rely on
+   ownership (private per-user data files) or SELinux (wrong label on a
+   datadir file gets the app's read/write denied in enforcing mode) then
+   break. Copy uid/gid/mode and the security.selinux label from the pristine
+   original onto the patched build so the mount is transparent. Best-effort:
+   logs failures but never fails the caller. chmod must come after chown -
+   chown clears setuid/setgid bits. */
+static void copy_file_attrs(const char *src, const char *dst) {
+    struct stat st;
+    if (stat(src, &st) != 0) {
+        logmsg("cannot stat %s to copy attrs: %s", src, strerror(errno));
+        return;
+    }
+
+    char sctx[512];
+    ssize_t sclen = lgetxattr(src, "security.selinux", sctx, sizeof(sctx) - 1);
+
+    if (chown(dst, st.st_uid, st.st_gid) != 0) {
+        logmsg("chown %s -> %d:%d failed: %s", dst, (int)st.st_uid, (int)st.st_gid, strerror(errno));
+    }
+    if (chmod(dst, st.st_mode & 07777) != 0) {
+        logmsg("chmod %s -> %o failed: %s", dst, st.st_mode & 07777, strerror(errno));
+    }
+
+    if (sclen >= 0) {
+        sctx[sclen] = 0;
+        if (lsetxattr(dst, "security.selinux", sctx, (size_t)sclen, 0) != 0) {
+            logmsg("setfilecon %s -> %s failed: %s", dst, sctx, strerror(errno));
+        } else {
+            logmsg("attrs copied %s -> %s (uid=%d gid=%d mode=%o scontext=%s)",
+                   src, dst, (int)st.st_uid, (int)st.st_gid, st.st_mode & 07777, sctx);
+        }
+    } else {
+        logmsg("attrs copied %s -> %s (uid=%d gid=%d mode=%o, no scontext on source)",
+               src, dst, (int)st.st_uid, (int)st.st_gid, st.st_mode & 07777);
+    }
 }
 
 /* ---------------- CRC32 ---------------- */
@@ -582,26 +659,33 @@ static char *fetch_config(const char *config_url) {
     snprintf(full_path, sizeof(full_path), "%s%.*s", path, q.len, q.len ? (const char *)q.buf : "");
     free(q.buf);
 
-    logmsg("fetching config: https://%s%s", host, full_path);
+    /* Polls themselves are not logged (one every few seconds would flood the
+       log); a failure is logged once when it starts, and once more when
+       fetching works again. */
+    static int fetch_failing = 0;
     int status = 0;
     char *body = https_get(host, full_path, 5, &status);
 
     if (!body) {
-        logmsg("config fetch failed (network/TLS error)");
+        if (!fetch_failing) logmsg("config fetch failed (network/TLS error): https://%s%s", host, full_path);
+        fetch_failing = 1;
         return NULL;
     }
     if (status < 200 || status >= 300) {
-        logmsg("config fetch got HTTP %d, ignoring", status);
+        if (!fetch_failing) logmsg("config fetch got HTTP %d, ignoring", status);
+        fetch_failing = 1;
         free(body);
         return NULL;
     }
     if (!body[0]) {
-        logmsg("config fetch returned empty body, ignoring");
+        if (!fetch_failing) logmsg("config fetch returned empty body, ignoring");
+        fetch_failing = 1;
         free(body);
         return NULL;
     }
 
-    logmsg("config fetched (%zu bytes)", strlen(body));
+    if (fetch_failing) logmsg("config fetch works again (%zu bytes)", strlen(body));
+    fetch_failing = 0;
     return body;
 }
 
@@ -765,14 +849,20 @@ static int apply_rules_to_file(const char *full_path, const char *relpath,
    next launch picks up the freshly patched assets. */
 static void restart_app(const char *package_name) {
     if (!package_name || !package_name[0]) return;
+    /* Always restart only after a short delay, so the freshly mounted (or
+       unmounted) file has settled in every relevant mount namespace before
+       the app is killed - otherwise its re-fork would come up against the
+       file it had open before the (un)mount. Callers invoke this right after
+       every mount and every unmount. */
+    usleep(100 * 1000);
     pid_t pid = fork();
     if (pid == 0) {
-        execl("/system/bin/am", "am", "force-stop", package_name, (char *)NULL);
+        execl("/system/bin/killall", "killall", package_name, (char *)NULL);
         _exit(127);
     } else if (pid > 0) {
         int status;
         waitpid(pid, &status, 0);
-        logmsg("restarted app: am force-stop %s (exit %d)", package_name,
+        logmsg("restarted app: killall %s (exit %d)", package_name,
                WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     } else {
         logmsg("restart_app: fork failed (%s)", strerror(errno));
@@ -917,9 +1007,59 @@ static int mount_over_all_copies(const char *source, const char *system_path, co
    Android recreates an isolated mount namespace).  The config fast path must
    not make that loss permanent: restore cached mounts before deciding that
    there is nothing new to process. */
-static void ensure_cached_mounts(const char *cache_index_path) {
+/* Deletes every patched*.apk next to the cache index that no cache row
+   references any more - left behind when a target is reverted, its row is
+   dropped as stale, or the target is renamed. A file that is still
+   bind-mounted somewhere stays alive through the mount, so unlinking it
+   is always safe. */
+static void gc_patched_files(const char *cache_index_path) {
+    char dir[600];
+    snprintf(dir, sizeof(dir), "%s", cache_index_path);
+    char *slash = strrchr(dir, '/');
+    if (slash) *slash = 0; else snprintf(dir, sizeof(dir), ".");
+
     cache_index_t idx;
-    if (cache_index_load(cache_index_path, &idx) != 0) return;
+    cache_index_load(cache_index_path, &idx);
+
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        size_t len = strlen(de->d_name);
+        if (strncmp(de->d_name, "patched", 7) != 0 || len < 4 ||
+            strcmp(de->d_name + len - 4, ".apk") != 0) continue;
+        char full[900];
+        snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
+        int used = 0;
+        for (int i = 0; i < idx.count; i++) {
+            if (!strcmp(idx.entries[i].patched_path, full)) { used = 1; break; }
+        }
+        if (used) continue;
+        if (unlink(full) == 0) logmsg("removed unused cached patch: %s", full);
+        else logmsg("cannot remove unused cached patch %s: %s", full, strerror(errno));
+    }
+    closedir(d);
+}
+
+static int rm_tree_cb(const char *path, const struct stat *sb, int flag, struct FTW *ftw) {
+    (void)sb; (void)flag; (void)ftw;
+    remove(path);
+    return 0;
+}
+
+/* rm -rf; a missing path is fine. */
+static void rm_tree(const char *path) {
+    nftw(path, rm_tree_cb, 16, FTW_DEPTH | FTW_PHYS);
+}
+
+/* Re-establishes cached mounts that went missing. A row whose original
+   changed underneath it (app update, the app rewrote its own file, ...) is
+   dropped instead of being re-checked - and re-logged - every cycle.
+   Returns the number of rows dropped. */
+static int ensure_cached_mounts(const char *cache_index_path) {
+    cache_index_t idx;
+    if (cache_index_load(cache_index_path, &idx) != 0) return 0;
+    int dropped = 0;
 
     for (int i = 0; i < idx.count; i++) {
         const cache_entry_t *e = &idx.entries[i];
@@ -930,10 +1070,21 @@ static void ensure_cached_mounts(const char *cache_index_path) {
                       source_st.st_ino == target_st.st_ino;
         if (mounted) continue;
 
+        /* Something else may be mounted over the target (e.g. a stale
+           mount of an older build): peel it off so the fingerprint below
+           sees the real original, as process_target() does. */
+        for (int k = 0; k < 8 && umount2(e->name, MNT_DETACH) == 0; k++) {}
+
         char current_hex[41];
-        if (content_fingerprint(e->name, current_hex) != 0 ||
-            strcmp(current_hex, e->orig) != 0) {
-            logmsg("cached mount missing but original changed, not restoring: %s", e->name);
+        if (content_fingerprint(e->name, current_hex) != 0) {
+            /* Not readable (yet) - e.g. credential-encrypted app data before
+               unlock. Not a changed original: keep the row, retry later. */
+            continue;
+        }
+        if (strcmp(current_hex, e->orig) != 0) {
+            logmsg("cached mount missing and original changed, dropping stale cache row: %s", e->name);
+            cache_index_remove(cache_index_path, e->name);
+            dropped++;
             continue;
         }
 
@@ -942,6 +1093,8 @@ static void ensure_cached_mounts(const char *cache_index_path) {
         logmsg("restored lost cached mount: %s (%d mount(s))", e->name, mounts);
         if (mounts > 0) restart_app(e->package_name);
     }
+    if (dropped) gc_patched_files(cache_index_path);
+    return dropped;
 }
 
 static void cb_unmount(const char *path, void *ctx) {
@@ -1090,13 +1243,26 @@ static void led_stop_patching_blink(pid_t pid) {
     led_off();
 }
 
-/* Holds a solid result color for 10s, then turns the ring off. Blocking -
-   only called after the blinker has already been stopped, so nothing else
-   is depending on this process in the meantime. */
-static void led_show_result(int success) {
-    led_set(success ? "green" : "red", 200);
-    sleep(10);
-    led_off();
+/* Overall per-config result, shown asynchronously in a forked child so it
+   never blocks the poll loop: the result color blinks 3x (1s on / 1s off),
+   then the ring is turned off. No per-target 10s hold anymore - statuses are
+   aggregated across the whole config and this is blinked once at the end. */
+#define LED_STATUS_FAILED 0
+#define LED_STATUS_PATCHED 1
+#define LED_STATUS_SKIPPED 2
+static void led_show_final(int status) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        for (int t = 0; t < 3; t++) {
+            if (status == LED_STATUS_SKIPPED) led_set_yellow(200);
+            else led_set(status == LED_STATUS_PATCHED ? "green" : "red", 200);
+            sleep(1);
+            led_off();
+            if (t < 2) sleep(1);
+        }
+        _exit(0);
+    }
+    if (pid < 0) logmsg("led_show_final: fork failed (%s)", strerror(errno));
 }
 
 static void notify_revert(void) { led_pulse("blue", 3, 100, 100); }
@@ -1118,59 +1284,37 @@ static void phase0_instant_mount(const char *cache_index_path) {
         const cache_entry_t *e = &idx0.entries[i];
         umount2(e->name, MNT_DETACH);
         char hex[41];
-        if (content_fingerprint(e->name, hex) != 0) continue;
-        if (strcmp(e->orig, hex) != 0) continue;
+        if (content_fingerprint(e->name, hex) != 0) {
+            /* Not readable this early: credential-encrypted app data (FBE) is
+               still locked, so a file target inside /data/user/ can't be
+               mounted yet. Ignore it - leave its cache row alone and let the
+               daemon patch it once storage is unlocked. */
+            logmsg("target not readable at boot, leaving for daemon: %s", e->name);
+            continue;
+        }
+        if (strcmp(e->orig, hex) != 0) {
+            logmsg("original changed, dropping stale cache row: %s", e->name);
+            cache_index_remove(cache_index_path, e->name);
+            continue;
+        }
         struct stat pst;
         if (stat(e->patched_path, &pst) != 0 || pst.st_size == 0) continue;
         int m = mount_over_all_copies(e->patched_path, e->name, e->package_name);
         logmsg("instant local-cache mount (no network): %s (%d mount(s))", e->name, m);
-    }
-}
-
-/* At boot the launcher/app process is forked from zygote EARLY - typically
-   before the daemon's first cycle injects our patched-APK mount into zygote's
-   mount namespace. That process therefore loaded the ORIGINAL, unpatched APK,
-   and its resources (e.g. QUASAR_BACKEND) are stale; our later mount only
-   affects processes forked AFTER it. We can't reliably win that fork race, so
-   instead we force-stop each patched APK target's package once, right after
-   phase0 has (re)established the mounts in the zygote namespaces on the first
-   daemon cycle. Android re-forks the app from zygote - which now sees the
-   patched APK - so it comes back patched. This is exactly the manual
-   `am force-stop <pkg>` that was verified to work, done automatically.
-
-   Only packages whose target is actually bind-mounted to our patched file
-   right now are restarted. If a mount was skipped - most importantly when an
-   OTA firmware update changed the original APK out from under a stale cached
-   patch (phase0's orig-hash guard refuses to mount it) - there is nothing
-   patched to reload, so the freshly-booted app is left alone on the new
-   original, and the daemon rebuilds from that new original later. Each
-   package is restarted at most once. */
-static void restart_apps_for_boot_mounts(const char *cache_index_path) {
-    cache_index_t idx;
-    if (cache_index_load(cache_index_path, &idx) != 0) return;
-
-    for (int i = 0; i < idx.count; i++) {
-        const cache_entry_t *e = &idx.entries[i];
-        if (!e->package_name[0]) continue;   /* plain-file target: no app to restart */
-
-        /* Is e->name currently OUR bind mount? (target path resolves to the
-           same dev+inode as the patched source file it's mounted from). */
-        struct stat s_src, s_tgt;
-        if (stat(e->patched_path, &s_src) != 0 || stat(e->name, &s_tgt) != 0) continue;
-        if (s_src.st_dev != s_tgt.st_dev || s_src.st_ino != s_tgt.st_ino) continue;
-
-        /* Don't force-stop the same package twice (a package can have several
-           cached rows, e.g. base.apk plus split/copy paths). */
-        int already = 0;
-        for (int j = 0; j < i; j++) {
-            if (idx.entries[j].package_name[0] &&
-                !strcmp(idx.entries[j].package_name, e->package_name)) { already = 1; break; }
+        /* Kill the app right after the mount (short delay inside restart_app)
+           so it reloads the patched APK - only for APK targets (they carry a
+           package_name), never for plain files. Don't kill the same package
+           twice (several cached rows can share one package). */
+        if (m > 0 && e->package_name[0]) {
+            int already = 0;
+            for (int j = 0; j < i; j++) {
+                if (idx0.entries[j].package_name[0] &&
+                    !strcmp(idx0.entries[j].package_name, e->package_name)) { already = 1; break; }
+            }
+            if (!already) restart_app(e->package_name);
         }
-        if (already) continue;
-
-        logmsg("boot: reloading %s so it re-forks with the patched APK", e->package_name);
-        restart_app(e->package_name);
     }
+    gc_patched_files(cache_index_path);
 }
 
 /* Derives a stable, collision-free per-target output path from the CLI's
@@ -1222,14 +1366,53 @@ static void target_content_hash(const target_config_t *t, char *hex_out) {
     for (int i = 0; i < 20; i++) snprintf(hex_out + i * 2, 3, "%02x", digest[i]);
 }
 
+/* Target processing outcome, reported by process_target() and aggregated by
+   the caller into one LED status for the whole config. */
+#define TARGET_FAILED  (-1)  /* rebuild/mount error -> red */
+#define TARGET_SKIPPED 0     /* already patched (cache hit) -> yellow */
+#define TARGET_REBUILT 1     /* rebuilt + mounted -> green */
+
+/* Derives an Android package name from an app-data path of the form
+   /data/user/<uid>/<pkg>/... or /data/data/<pkg>/... Returns 0 and fills
+   out, or -1 if the path doesn't look like an app data dir. Used to restart
+   the owning app after patching a plain file target that lives inside its
+   private data directory. */
+static int package_name_from_path(const char *path, char *out, size_t outsz) {
+    const char *p;
+    if (!strncmp(path, "/data/user/", 11)) {
+        p = path + 11;
+        const char *slash = strchr(p, '/');
+        if (!slash) return -1;
+        p = slash + 1;
+    } else if (!strncmp(path, "/data/data/", 11)) {
+        p = path + 11;
+    } else {
+        return -1;
+    }
+    const char *end = strchr(p, '/');
+    size_t len = end ? (size_t)(end - p) : strlen(p);
+    if (len == 0 || len >= outsz) return -1;
+    memcpy(out, p, len);
+    out[len] = 0;
+    return 0;
+}
+
+/* Resolves the package to restart for a target: its explicit package_name,
+   or (for a plain-file target without one) the package derived from its
+   path. Returns 0 and fills out, or -1 if no package can be determined. */
+static int target_package(const target_config_t *t, char *out, size_t outsz) {
+    if (t->package_name[0]) { snprintf(out, outsz, "%s", t->package_name); return 0; }
+    if (!strcmp(t->type, "file")) return package_name_from_path(t->apk_path, out, outsz);
+    return -1;
+}
+
 /* Full extract/patch/sign/repack/mount pipeline for one target.
    Rebuilds only if (apk, target-content) isn't already in the cache index
-   for this target; mounts either way. Returns 1 when this target was really
-   rebuilt and successfully mounted, otherwise 0. The caller restarts apps
-   only after every target has been processed, so a runtime file target can
-   be applied before the APK process is restarted. LED-pulses at
-   start/success/failure (see notify_* above) since this device shows nothing
-   for standard Android notifications. */
+   for this target; mounts either way. Returns TARGET_REBUILT when this
+   target was really rebuilt and successfully mounted, TARGET_SKIPPED when
+   the cached patched build was reused (already patched), or TARGET_FAILED
+   on any error. The caller aggregates these into one LED status and restarts
+   apps only after every target has been processed. */
 static int process_target(const char *work_dir, const char *cache_index_path,
                           const char *base_patched_out, const target_config_t *tgt) {
     char cfg_hex[41];
@@ -1247,7 +1430,7 @@ static int process_target(const char *work_dir, const char *cache_index_path,
 
     if (tgt->rules.count == 0) {
         logmsg("target %s: no rules, nothing to do", target_apk);
-        return 0;
+        return TARGET_SKIPPED;
     }
 
     char patched_out[600];
@@ -1265,7 +1448,7 @@ static int process_target(const char *work_dir, const char *cache_index_path,
     char apk_hex[41];
     if (content_fingerprint(target_apk, apk_hex) != 0) {
         logmsg("cannot read target apk: %s", target_apk);
-        return 0;
+        return TARGET_FAILED;
     }
 
     cache_index_t idx1;
@@ -1281,8 +1464,11 @@ static int process_target(const char *work_dir, const char *cache_index_path,
         logmsg("target %s: apk + config unchanged, reusing cached patched APK", target_apk);
     }
 
-    int rebuilt = 0;
     if (!use_cached_patch) {
+        if (tgt->exec_before[0]) {
+            logmsg("target %s: running exec_before", target_apk);
+            run_exec_command(tgt->exec_before);
+        }
         pid_t blink_pid = led_start_patching_blink();
 
         if (is_file_type) {
@@ -1294,16 +1480,14 @@ static int process_target(const char *work_dir, const char *cache_index_path,
             if (!data) {
                 logmsg("cannot read target file: %s", target_apk);
                 led_stop_patching_blink(blink_pid);
-                led_show_result(0);
-                return 0;
+                return TARGET_FAILED;
             }
             int wr_ok = (write_whole_file(patched_out, data, flen) == 0);
             free(data);
             if (!wr_ok) {
                 logmsg("cannot write patched file: %s", patched_out);
                 led_stop_patching_blink(blink_pid);
-                led_show_result(0);
-                return 0;
+                return TARGET_FAILED;
             }
 
             char basename[256];
@@ -1316,8 +1500,7 @@ static int process_target(const char *work_dir, const char *cache_index_path,
             if (apply_rules_to_file(patched_out, basename, &tgt->rules, basename) == 0) {
                 logmsg("rules present but nothing matched, nothing to mount");
                 led_stop_patching_blink(blink_pid);
-                led_show_result(0);
-                return 0;
+                return TARGET_FAILED;
             }
             logmsg("patched plain file: %s", target_apk);
             goto rebuild_done;
@@ -1326,13 +1509,16 @@ static int process_target(const char *work_dir, const char *cache_index_path,
         const rule_set_t *rules_ptr = &tgt->rules;
         char extract_dir[768];
         snprintf(extract_dir, sizeof(extract_dir), "%s/apk_extract", work_dir);
+        /* Start from an empty dir: leftovers from an earlier (different)
+           APK would otherwise be repacked into this one. */
+        rm_tree(extract_dir);
         mkdir_p(extract_dir);
 
         if (extract_zip(target_apk, extract_dir) != 0) {
             logmsg("extract failed");
+            rm_tree(extract_dir);
             led_stop_patching_blink(blink_pid);
-            led_show_result(0);
-            return 0;
+            return TARGET_FAILED;
         }
         logmsg("APK extracted");
 
@@ -1348,9 +1534,9 @@ static int process_target(const char *work_dir, const char *cache_index_path,
 
         if (patched_count == 0) {
             logmsg("rules present but nothing matched, nothing to mount");
+            rm_tree(extract_dir);
             led_stop_patching_blink(blink_pid);
-            led_show_result(0);
-            return 0;
+            return TARGET_FAILED;
         }
 
     /* remove old META-INF */
@@ -1567,9 +1753,9 @@ static int process_target(const char *work_dir, const char *cache_index_path,
     FILE *out = fopen(patched_out, "wb");
     if (!out) {
         logmsg("cannot open output apk");
+        rm_tree(extract_dir);
         led_stop_patching_blink(blink_pid);
-        led_show_result(0);
-        return 0;
+        return TARGET_FAILED;
     }
 
     typedef struct { char name[512]; uint32_t crc; uint32_t size; uint32_t offset; } cdent_t;
@@ -1662,8 +1848,12 @@ static int process_target(const char *work_dir, const char *cache_index_path,
 
     fclose(out);
     logmsg("repacked -> %s (%d entries, STORED)", patched_out, total);
+    /* The extracted tree is as large as the APK itself (hundreds of MB) and
+       is never reused - the next rebuild extracts afresh. */
+    rm_tree(extract_dir);
 
 rebuild_done:
+    copy_file_attrs(target_apk, patched_out);
     {
         char patched_hex[41];
         if (content_fingerprint(patched_out, patched_hex) == 0) {
@@ -1672,28 +1862,35 @@ rebuild_done:
                    target_apk, apk_hex, patched_hex, cfg_hex);
         }
     }
-    rebuilt = 1;
     led_stop_patching_blink(blink_pid);
     logmsg("=== Patching complete: %s ===", target_apk);
     } /* end if (!use_cached_patch) */
 
     {
         const char *mount_source = use_cached_patch ? hit_patched_path : patched_out;
+        if (use_cached_patch) copy_file_attrs(target_apk, hit_patched_path);
         int mounted = mount_over_all_copies(mount_source, target_apk, package_name);
         logmsg("total mounts: %d", mounted);
 
-        if (rebuilt) {
-            led_show_result(mounted > 0);
+        if (use_cached_patch) return TARGET_SKIPPED;
+        if (mounted <= 0) return TARGET_FAILED;
+        if (tgt->exec_after[0]) {
+            logmsg("target %s: running exec_after", target_apk);
+            run_exec_command(tgt->exec_after);
         }
-        return rebuilt && mounted > 0;
+        return TARGET_REBUILT;
     }
 }
 
 /* One patch/poll cycle (daemon mode - post-fs-data's "boot" mode only ever
    calls phase0_instant_mount, never this):
-     0. phase0_instant_mount(), first cycle only. Later cycles skip it: the
-        mount from cycle 1 (or from an in-process rebuild) is still in
-        place, nothing to redo.
+      0. phase0_instant_mount(), on the very first cycle only. Later cycles
+         use ensure_cached_mounts(), which only touches a mount that has
+         actually gone missing - so while the network is still down at boot
+         the APK isn't re-mounted over itself and the app isn't killed again
+         every poll. *first_cycle stays set until the first config is
+         actually processed, which only forces that processing past the
+         "config unchanged" fast path.
      1. Fetch the remote config (short timeout). A network error, non-2xx
         status, or empty body all mean "nothing to do this cycle" - never a
         fallback patch. If the fetched config is byte-identical to the last
@@ -1708,11 +1905,17 @@ rebuild_done:
      3. Run the config's "exec" root command, if any and if it changed since
         last time. */
 static void run_cycle(const char *work_dir, const char *cache_index_path,
-                       const char *patched_out, patcher_state_t *st, int first_cycle) {
-    if (first_cycle) {
+                       const char *patched_out, patcher_state_t *st, int *first_cycle) {
+    static int phase0_done = 0;
+    int force_process = 0;
+    if (!phase0_done) {
         phase0_instant_mount(cache_index_path);
+        phase0_done = 1;
     } else {
-        ensure_cached_mounts(cache_index_path);
+        /* A cache row whose original changed underneath it was dropped:
+           process the config again even if it's unchanged, so that target
+           gets rebuilt from its new original. */
+        force_process = ensure_cached_mounts(cache_index_path) > 0;
     }
 
     /* ---- Phase 1: fetch remote config, patch/mount/revert if it changed ---- */
@@ -1721,35 +1924,14 @@ static void run_cycle(const char *work_dir, const char *cache_index_path,
         return;
     }
     char *config_text = fetch_config(st->config_url);
-    if (!config_text) {
-        logmsg("nothing to do this cycle (config unavailable)");
-        return;
-    }
-
-    /* A successful fetch means the network is up. This is the right moment -
-       and only once per daemon lifetime - to reload the launcher/app that
-       booted off the original (unpatched) APK before our mount reached
-       zygote's namespace. Doing it at the very first cycle (before the network
-       was up) was wrong: the app would restart, fail to reach the redirected
-       backend (no network yet), and latch onto its fallback host - so it must
-       wait until the backend is actually reachable. By now phase0 has the
-       patched APK mounted in zygote, so the re-forked app comes up patched AND
-       can immediately reach the redirected backend. restart_apps_for_boot_
-       mounts() only touches packages whose APK is really mounted, so an
-       OTA-invalidated (unmounted) target is left alone. */
-    static int boot_app_reload_done = 0;
-    if (!boot_app_reload_done) {
-        restart_apps_for_boot_mounts(cache_index_path);
-        boot_app_reload_done = 1;
-    }
+    if (!config_text) return;
 
     unsigned char cfg_digest[20];
     sha1_buf((const unsigned char *)config_text, strlen(config_text), cfg_digest);
     char cfg_hex[41];
     for (int i = 0; i < 20; i++) snprintf(cfg_hex + i * 2, 3, "%02x", cfg_digest[i]);
 
-    if (!first_cycle && !strcmp(cfg_hex, st->last_config_hash)) {
-        logmsg("config unchanged since last check, nothing to do");
+    if (!*first_cycle && !force_process && !strcmp(cfg_hex, st->last_config_hash)) {
         free(config_text);
         return;
     }
@@ -1784,12 +1966,12 @@ static void run_cycle(const char *work_dir, const char *cache_index_path,
     }
 
     logmsg("config has %d target(s)", cfg->target_count);
-    int rebuilt_target = 0;
+    int has_failed = 0, has_rebuilt = 0;
     for (int i = 0; i < cfg->target_count; i++) {
         if (!cfg->targets[i].apk_path[0]) continue;
-        if (process_target(work_dir, cache_index_path, patched_out, &cfg->targets[i])) {
-            rebuilt_target = 1;
-        }
+        int r = process_target(work_dir, cache_index_path, patched_out, &cfg->targets[i]);
+        if (r == TARGET_FAILED) has_failed = 1;
+        else if (r == TARGET_REBUILT) has_rebuilt = 1;
     }
 
     /* Revert anything we've previously patched that this config no longer
@@ -1811,24 +1993,31 @@ static void run_cycle(const char *work_dir, const char *cache_index_path,
             notify_revert();
         }
     }
+    gc_patched_files(cache_index_path);
 
     /* Restart the affected application only after all targets are mounted.
-       This matters when the APK target is reused from cache but one or more
-       persistent files copied out of that APK were rebuilt in this cycle. */
-    if (rebuilt_target) {
+       The package for an APK target comes from the config; for a plain-file
+       target living inside an app's data dir it's derived from the path. */
+    if (has_rebuilt) {
         for (int i = 0; i < cfg->target_count; i++) {
-            const char *package_name = cfg->targets[i].package_name;
-            if (!package_name[0]) continue;
+            char package_name[256];
+            if (target_package(&cfg->targets[i], package_name, sizeof(package_name)) != 0) continue;
             int already_restarted = 0;
             for (int j = 0; j < i; j++) {
-                if (!strcmp(cfg->targets[j].package_name, package_name)) {
-                    already_restarted = 1;
-                    break;
-                }
+                char pkgj[256];
+                if (target_package(&cfg->targets[j], pkgj, sizeof(pkgj)) == 0 &&
+                    !strcmp(pkgj, package_name)) { already_restarted = 1; break; }
             }
             if (!already_restarted) restart_app(package_name);
         }
     }
+
+    /* One aggregated LED result per config, blinked asynchronously: red if
+       anything failed, green if anything was actually (re)patched, yellow if
+       nothing failed and nothing was rebuilt (everything already patched). */
+    if (has_failed) led_show_final(LED_STATUS_FAILED);
+    else if (has_rebuilt) led_show_final(LED_STATUS_PATCHED);
+    else led_show_final(LED_STATUS_SKIPPED);
 
     if (cfg->exec_cmd[0]) {
         unsigned char eh[20];
@@ -1845,6 +2034,12 @@ static void run_cycle(const char *work_dir, const char *cache_index_path,
     free_patch_config(cfg);
     free(cfg);
     free(config_text);
+    /* First cycle only ends once a config was actually fetched AND processed.
+       If the network wasn't up yet on earlier iterations (fetch failed), we
+       must still bypass the fast path so stale cache rows boot deleted get rebuilt -
+       otherwise the "config unchanged" fast path would leave the device
+       unpatched after an OTA/invalidated cache. */
+    *first_cycle = 0;
 }
 
 /* Directory the running executable itself lives in - e.g. for a binary at
@@ -1924,7 +2119,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    snprintf(g_log_path, sizeof(g_log_path), "%s", log_path);
     g_log = fopen(log_path, "a");
+    log_trim_if_needed();
     crc32_init();
 
     logmsg("=== Online Patcher for Magisk (mode=%s) started ===", mode);
@@ -1942,6 +2139,7 @@ int main(int argc, char **argv) {
         }
         cache_index_t empty; empty.count = 0;
         cache_index_save(cache_index_path, &empty);
+        gc_patched_files(cache_index_path);
         notify_revert();
         logmsg("=== Revert complete: %d target(s) restored ===", idx.count);
         return 0;
@@ -1982,8 +2180,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "daemon")) {
         int first = 1;
         for (;;) {
-            run_cycle(work_dir, cache_index_path, patched_out, &st, first);
-            first = 0;
+            run_cycle(work_dir, cache_index_path, patched_out, &st, &first);
             state_save(state_path, &st);
             int interval = st.poll_interval > 0 ? st.poll_interval : 10;
             sleep((unsigned int)interval);

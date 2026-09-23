@@ -4,6 +4,7 @@
 //     "poll_interval": 10, "config_url": "...", "exec": "...",
 //     "targets": [
 //       { "apk_path": "...", "package_name": "...",
+//         "exec_before": "...", "exec_after": "...",
 //         "rules": [ { "file_name": "...", "pattern": "...", "replace": "..." }, ... ] },
 //       ...
 //     ]
@@ -179,10 +180,17 @@ typedef struct {
     char apk_path[512];
     char package_name[256];
     char type[16];      /* "apk" (default) or "file" - see process_target() */
+    /* Optional root shell commands run around an actual (re)patch of this
+       target - not on a cached reuse: exec_before right before the rebuild
+       starts, exec_after once the patched build is mounted (before the app
+       is restarted). Empty = none. */
+    char exec_before[1024];
+    char exec_after[1024];
     rule_set_t rules;
 } target_config_t;
 
-/* Parses one { "apk_path": "...", "package_name": "...", "type": "...", "rules": [...] }
+/* Parses one { "apk_path": "...", "package_name": "...", "exec_before": "...",
+   "exec_after": "...", "rules": [...] }
    object. Keys may appear in any order. Returns a pointer just past the
    closing '}', or NULL on malformed input (apk_path/package_name missing is
    not a parse error - caller decides whether that target is usable). */
@@ -210,7 +218,7 @@ static const char *json_parse_target_object(const char *p, target_config_t *t) {
             p = json_parse_rules_array(p, &t->rules);
             if (!p) return NULL;
         } else {
-            char value[512];
+            char value[1024];
             const char *after = json_parse_string(p, value, sizeof(value));
             if (!after) return NULL;
             p = after;
@@ -226,6 +234,10 @@ static const char *json_parse_target_object(const char *p, target_config_t *t) {
                 snprintf(t->type, sizeof(t->type), "file");
             } else if (!strcmp(key, "package_name")) {
                 snprintf(t->package_name, sizeof(t->package_name), "%s", value);
+            } else if (!strcmp(key, "exec_before")) {
+                snprintf(t->exec_before, sizeof(t->exec_before), "%s", value);
+            } else if (!strcmp(key, "exec_after")) {
+                snprintf(t->exec_after, sizeof(t->exec_after), "%s", value);
             }
         }
 
