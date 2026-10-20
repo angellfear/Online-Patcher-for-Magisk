@@ -32,12 +32,16 @@
    replace/replace_hex/replace_file is expected per rule; if more than one
    is given, resolve_*() picks a fixed precedence (hex over plain, file
    over hex over plain). */
+/* pattern_hex / replace / replace_hex are heap strings of whatever length
+   the config carries (a binary AndroidManifest.xml chunk is ~15 KB, i.e.
+   ~30k hex digits). They're never NULL after a successful parse, and are
+   freed by free_patch_config(). */
 typedef struct {
     char file_name[256];
     char pattern[512];
-    char pattern_hex[4096];
-    char replace[4096]; /* generous headroom - e.g. embedding a full X.509 cert's hex into a mac_permissions.xml rule is 2000+ chars */
-    char replace_hex[8192];
+    char *pattern_hex;
+    char *replace;
+    char *replace_hex;
     char replace_file[512];
 } patch_rule_t;
 
@@ -84,6 +88,26 @@ static const char *json_parse_string(const char *p, char *out, int outsz) {
     return p + 1;
 }
 
+/* Like json_parse_string(), but allocates a buffer exactly big enough for the
+   unescaped value (no length limit). *out is malloc'd; caller frees. Returns
+   a pointer just past the closing quote, or NULL on malformed input / OOM. */
+static const char *json_parse_string_dyn(const char *p, char **out) {
+    if (*p != '"') return NULL;
+    const char *q = p + 1;
+    size_t n = 0;
+    while (*q && *q != '"') {
+        if (*q == '\\' && q[1]) q++;
+        q++;
+        n++;
+    }
+    if (*q != '"') return NULL;
+    char *buf = (char *)malloc(n + 1);
+    if (!buf) return NULL;
+    json_parse_string(p, buf, (int)(n + 1));
+    *out = buf;
+    return q + 1;
+}
+
 static const char *json_parse_number(const char *p, long *out) {
     p = json_skip_ws(p);
     char *end;
@@ -97,6 +121,13 @@ static const char *json_parse_number(const char *p, long *out) {
    object into `rule`. Keys may appear in any order; unknown keys are
    skipped (their string value is read and discarded). Returns a pointer
    just past the closing '}', or NULL on malformed input. */
+static void free_rule_fields(patch_rule_t *rule) {
+    free(rule->pattern_hex);
+    free(rule->replace);
+    free(rule->replace_hex);
+    rule->pattern_hex = rule->replace = rule->replace_hex = NULL;
+}
+
 static const char *json_parse_rule_object(const char *p, patch_rule_t *rule) {
     memset(rule, 0, sizeof(*rule));
     p = json_skip_ws(p);
@@ -105,42 +136,54 @@ static const char *json_parse_rule_object(const char *p, patch_rule_t *rule) {
 
     for (;;) {
         p = json_skip_ws(p);
-        if (*p == '}') return p + 1;
-        if (*p != '"') return NULL;
+        if (*p == '}') goto done;
+        if (*p != '"') goto fail;
 
         char key[64];
         p = json_parse_string(p, key, sizeof(key));
-        if (!p) return NULL;
+        if (!p) goto fail;
 
         p = json_skip_ws(p);
-        if (*p != ':') return NULL;
+        if (*p != ':') goto fail;
         p++;
         p = json_skip_ws(p);
 
-        char value[8192];
-        p = json_parse_string(p, value, sizeof(value));
-        if (!p) return NULL;
+        char *value = NULL;
+        p = json_parse_string_dyn(p, &value);
+        if (!p) goto fail;
 
         if (!strcmp(key, "file_name") || !strcmp(key, "file") || !strcmp(key, "mask")) {
             snprintf(rule->file_name, sizeof(rule->file_name), "%s", value);
         } else if (!strcmp(key, "pattern") || !strcmp(key, "from")) {
             snprintf(rule->pattern, sizeof(rule->pattern), "%s", value);
-        } else if (!strcmp(key, "pattern_hex")) {
-            snprintf(rule->pattern_hex, sizeof(rule->pattern_hex), "%s", value);
-        } else if (!strcmp(key, "replace") || !strcmp(key, "to")) {
-            snprintf(rule->replace, sizeof(rule->replace), "%s", value);
-        } else if (!strcmp(key, "replace_hex")) {
-            snprintf(rule->replace_hex, sizeof(rule->replace_hex), "%s", value);
         } else if (!strcmp(key, "replace_file")) {
             snprintf(rule->replace_file, sizeof(rule->replace_file), "%s", value);
+        } else if (!strcmp(key, "pattern_hex")) {
+            free(rule->pattern_hex); rule->pattern_hex = value; value = NULL;
+        } else if (!strcmp(key, "replace") || !strcmp(key, "to")) {
+            free(rule->replace); rule->replace = value; value = NULL;
+        } else if (!strcmp(key, "replace_hex")) {
+            free(rule->replace_hex); rule->replace_hex = value; value = NULL;
         }
         /* unknown keys: value already consumed, just ignore */
+        free(value);
 
         p = json_skip_ws(p);
         if (*p == ',') { p++; continue; }
-        if (*p == '}') return p + 1;
-        return NULL;
+        if (*p == '}') goto done;
+        goto fail;
     }
+
+done:
+    if (*p == '}') p++;
+    if (!rule->pattern_hex) rule->pattern_hex = strdup("");
+    if (!rule->replace) rule->replace = strdup("");
+    if (!rule->replace_hex) rule->replace_hex = strdup("");
+    if (!rule->pattern_hex || !rule->replace || !rule->replace_hex) { free_rule_fields(rule); return NULL; }
+    return p;
+fail:
+    free_rule_fields(rule);
+    return NULL;
 }
 
 /* Parses a JSON array of rule objects starting at *p (the opening '[').
@@ -328,6 +371,8 @@ static int parse_patch_config(const char *json, patch_config_t *cfg) {
 static void free_patch_config(patch_config_t *cfg) {
     if (!cfg) return;
     for (int i = 0; i < MAX_TARGETS; i++) {
+        for (int k = 0; k < cfg->targets[i].rules.count; k++)
+            free_rule_fields(&cfg->targets[i].rules.rules[k]);
         free(cfg->targets[i].rules.rules);
         cfg->targets[i].rules.rules = NULL;
         cfg->targets[i].rules.count = 0;

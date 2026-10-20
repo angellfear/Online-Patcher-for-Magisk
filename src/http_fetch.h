@@ -102,6 +102,35 @@ static int tls_lib_load(void) {
    the status line couldn't be parsed) - a 200 response and a 404 error page
    both come back as a non-NULL body, so callers that care about the
    difference need this. */
+
+/* Reassembles a chunked HTTP body (everything after the headers) into a
+   malloc'd, NUL-terminated string. Tolerates a truncated stream: whatever
+   complete data was received is returned. */
+static char *http_dechunk(const char *body) {
+    size_t cap = strlen(body) + 1;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+    size_t o = 0;
+    const char *p = body;
+    for (;;) {
+        char *end;
+        unsigned long sz = strtoul(p, &end, 16);
+        if (end == p) break;
+        const char *eol = strstr(end, "\r\n");
+        if (!eol) break;
+        p = eol + 2;
+        if (sz == 0) break;
+        size_t avail = strlen(p);
+        if (sz > avail) sz = avail;
+        memcpy(out + o, p, sz);
+        o += sz;
+        p += sz;
+        if (p[0] == '\r' && p[1] == '\n') p += 2;
+        else break;
+    }
+    out[o] = 0;
+    return out;
+}
 static char *https_get(const char *host, const char *path, int timeout_sec, int *out_status) {
     if (out_status) *out_status = 0;
     if (!g_tls.ok && tls_lib_load() != 0) return NULL;
@@ -188,7 +217,28 @@ static char *https_get(const char *host, const char *path, int timeout_sec, int 
     if (!body) { free(buf); return NULL; }
     body += 4;
 
-    char *result = strdup(body);
+    /* The server may answer with "Transfer-Encoding: chunked" (Apache does
+       for generated responses): the body is then a series of
+       "<hex size> CRLF <data> CRLF" pieces that must be reassembled, or the
+       chunk-size lines end up in the middle of the JSON. */
+    char *result;
+    {
+        size_t hl = (size_t)(body - buf);
+        char *hdr = (char *)malloc(hl + 1);
+        int chunked = 0;
+        if (hdr) {
+            for (size_t i = 0; i < hl; i++) hdr[i] = (char)((buf[i] >= 'A' && buf[i] <= 'Z') ? buf[i] + 32 : buf[i]);
+            hdr[hl] = 0;
+            const char *te = strstr(hdr, "\ntransfer-encoding:");
+            if (te) {
+                const char *eol = strstr(te + 1, "\r\n");
+                const char *ch = strstr(te, "chunked");
+                chunked = ch && (!eol || ch < eol);
+            }
+            free(hdr);
+        }
+        result = chunked ? http_dechunk(body) : strdup(body);
+    }
     free(buf);
     return result;
 }

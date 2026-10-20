@@ -2196,7 +2196,7 @@ static void run_cycle(const char *work_dir, const char *cache_index_path,
         return;
     }
     if (parse_patch_config(config_text, cfg) != 0) {
-        logmsg("received config is not valid JSON, ignoring");
+        log_once("received config %.12s (%zu bytes) is not valid JSON, ignoring", cfg_hex, strlen(config_text));
         free_patch_config(cfg);
         free(cfg);
         free(config_text);
