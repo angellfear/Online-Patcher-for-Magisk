@@ -61,6 +61,7 @@ static int enter_mount_namespace(int nsfd) {
 #include "rules_json.h"
 #include "cache_index.h"
 #include "patcher_state.h"
+#include "safety.h"
 
 static FILE *g_log = NULL;
 static char g_log_path[600];
@@ -1007,11 +1008,198 @@ static int mount_over_all_copies(const char *source, const char *system_path, co
    Android recreates an isolated mount namespace).  The config fast path must
    not make that loss permanent: restore cached mounts before deciding that
    there is nothing new to process. */
+/* ---------------- Boot safety ----------------
+   A patched system file that is broken can hang Android's own boot (see
+   safety.h), after which the network never comes up and the patcher can
+   never fetch a fix. Three layers keep that from happening or from sticking:
+
+   1. patched_file_sane(): a patched file is checked before it's cached or
+      mounted - at build time and again before every (boot-time) mount.
+   2. boot_guard: post-fs-data ("boot" mode) bumps an attempt counter in
+      boot_guard; the daemon deletes the file once sys.boot_completed=1. So
+      a guard that is still there at the next boot means the previous boot
+      never completed. Level 1 (second attempt) skips plain-file targets,
+      level 2 (third and later) skips every patch - the device then boots
+      stock, with its network, and can be fixed remotely.
+   3. Watchdog: if boot_completed hasn't happened BOOT_TIMEOUT_SEC after
+      the daemon started, the plain-file builds currently in the cache are
+      put in quarantine (by content hash - the same bad output is never
+      mounted again, a corrected one is) and the device is rebooted. */
+#define BOOT_TIMEOUT_SEC 600
+#define BOOT_MAX_REBOOTS 3
+
+static char g_guard_path[600];
+static char g_quar_path[600];
+static int g_skip_level = 0;   /* 0 = normal, 1 = skip file targets, 2 = skip all */
+static int g_deferred = 0;     /* a target was held back by safe mode this cycle */
+static time_t g_daemon_start;
+
+static int guard_attempts(void) {
+    FILE *f = fopen(g_guard_path, "r");
+    if (!f) return 0;
+    int n = 0;
+    if (fscanf(f, "attempts=%d", &n) != 1) n = 1;
+    fclose(f);
+    return n < 1 ? 1 : n;
+}
+
+static void guard_write(int n) {
+    FILE *f = fopen(g_guard_path, "w");
+    if (!f) return;
+    fprintf(f, "attempts=%d\n", n);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+}
+
+static int skip_level_for(int attempts) {
+    return attempts <= 1 ? 0 : (attempts == 2 ? 1 : 2);
+}
+
+/* Is this cache row a plain-file patch (as opposed to a ZIP/APK)? Those are
+   the ones that can wedge the boot, so safe mode / quarantine cover them. */
+static int patched_is_plain_file(const char *patched_path) {
+    unsigned char sig[4] = {0};
+    FILE *f = fopen(patched_path, "rb");
+    if (!f) return 1;
+    size_t n = fread(sig, 1, 4, f);
+    fclose(f);
+    return !(n == 4 && sig[0] == 'P' && sig[1] == 'K' && sig[2] == 3 && sig[3] == 4);
+}
+
+static int quarantined(const char *patched_sha1) {
+    FILE *f = fopen(g_quar_path, "r");
+    if (!f) return 0;
+    char line[128];
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (!strcmp(line, patched_sha1)) { found = 1; break; }
+    }
+    fclose(f);
+    return found;
+}
+
+static void quarantine_add(const char *patched_sha1) {
+    if (quarantined(patched_sha1)) return;
+    FILE *f = fopen(g_quar_path, "a");
+    if (!f) return;
+    fprintf(f, "%s\n", patched_sha1);
+    fclose(f);
+}
+
+/* 1 if the patched file is safe to hand to the system. */
+static int patched_file_sane(const char *patched_path, const char *target_path) {
+    struct stat st;
+    if (stat(patched_path, &st) != 0 || st.st_size == 0) {
+        logmsg("sanity: %s is missing or empty", patched_path);
+        return 0;
+    }
+    size_t tl = strlen(target_path);
+    if (tl > 4 && !strcmp(target_path + tl - 4, ".xml")) {
+        long len;
+        unsigned char *data = read_whole_file(patched_path, &len);
+        if (!data) { logmsg("sanity: cannot read %s", patched_path); return 0; }
+        char err[160];
+        int ok = xml_wellformed(data, len, err, sizeof(err));
+        free(data);
+        if (!ok) {
+            logmsg("sanity: %s is not well-formed XML (%s)", target_path, err);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* logmsg() that stays quiet for a message it has already printed - used for
+   conditions that are re-evaluated every poll cycle. */
+static void log_once(const char *fmt, ...) {
+    static uint32_t seen[64];
+    static int nseen = 0;
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    uint32_t h = 2166136261u;
+    for (const char *p = buf; *p; p++) { h ^= (unsigned char)*p; h *= 16777619u; }
+    for (int i = 0; i < nseen; i++) if (seen[i] == h) return;
+    if (nseen < 64) seen[nseen++] = h;
+    logmsg("%s", buf);
+}
+
+/* Should a cached row be left unmounted right now (safe mode / quarantine /
+   failed sanity check)? Logs why. A row that fails the sanity check is
+   dropped so the daemon rebuilds it. */
+static int row_blocked(const char *cache_index_path, const cache_entry_t *e) {
+    int is_file = patched_is_plain_file(e->patched_path);
+    if (g_skip_level >= 2 || (g_skip_level >= 1 && is_file)) {
+        log_once("safe mode (level %d): not mounting %s", g_skip_level, e->name);
+        g_deferred = 1;
+        return 1;
+    }
+    if (is_file && quarantined(e->patched)) {
+        log_once("quarantined build %.12s (an earlier boot hung with it): not mounting %s", e->patched, e->name);
+        return 1;
+    }
+    if (!patched_file_sane(e->patched_path, e->name)) {
+        logmsg("dropping unusable cached build of %s", e->name);
+        cache_index_remove(cache_index_path, e->name);
+        return 1;
+    }
+    return 0;
+}
+
+/* Daemon, once per loop: clear the guard when boot finished; otherwise, if
+   it is taking suspiciously long, quarantine and reboot. */
+static void boot_guard_tick(const char *cache_index_path) {
+    int attempts = guard_attempts();
+    if (attempts == 0) return;
+
+    char done[PROP_VALUE_MAX];
+    get_device_prop("sys.boot_completed", done, sizeof(done));
+    if (!strcmp(done, "1")) {
+        unlink(g_guard_path);
+        g_skip_level = 0;
+        logmsg("boot completed (attempt %d), boot guard cleared", attempts);
+        return;
+    }
+
+    static int fired = 0;
+    if (fired || difftime(time(NULL), g_daemon_start) < BOOT_TIMEOUT_SEC) return;
+    fired = 1;
+    if (attempts > BOOT_MAX_REBOOTS) {
+        logmsg("boot still not completed after %ds, attempt %d - giving up rebooting",
+               BOOT_TIMEOUT_SEC, attempts);
+        return;
+    }
+
+    cache_index_t idx;
+    cache_index_load(cache_index_path, &idx);
+    for (int i = 0; i < idx.count; i++) {
+        if (patched_is_plain_file(idx.entries[i].patched_path)) {
+            quarantine_add(idx.entries[i].patched);
+            logmsg("boot watchdog: quarantined build %.12s of %s",
+                   idx.entries[i].patched, idx.entries[i].name);
+        }
+    }
+    logmsg("boot watchdog: boot not completed %ds after start (attempt %d) - rebooting",
+           BOOT_TIMEOUT_SEC, attempts);
+    sync();
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl("/system/bin/reboot", "reboot", (char *)NULL);
+        _exit(127);
+    } else if (pid > 0) {
+        waitpid(pid, NULL, 0);
+    }
+}
+
 /* Deletes every patched*.apk next to the cache index that no cache row
    references any more - left behind when a target is reverted, its row is
    dropped as stale, or the target is renamed. A file that is still
    bind-mounted somewhere stays alive through the mount, so unlinking it
-   is always safe. */
+   is always safe. Stale patched*.tmp from an interrupted build go too. */
 static void gc_patched_files(const char *cache_index_path) {
     char dir[600];
     snprintf(dir, sizeof(dir), "%s", cache_index_path);
@@ -1027,7 +1215,8 @@ static void gc_patched_files(const char *cache_index_path) {
     while ((de = readdir(d)) != NULL) {
         size_t len = strlen(de->d_name);
         if (strncmp(de->d_name, "patched", 7) != 0 || len < 4 ||
-            strcmp(de->d_name + len - 4, ".apk") != 0) continue;
+            (strcmp(de->d_name + len - 4, ".apk") != 0 &&
+             strcmp(de->d_name + len - 4, ".tmp") != 0)) continue;
         char full[900];
         snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
         int used = 0;
@@ -1087,6 +1276,8 @@ static int ensure_cached_mounts(const char *cache_index_path) {
             dropped++;
             continue;
         }
+
+        if (row_blocked(cache_index_path, e)) continue;
 
         umount2(e->name, MNT_DETACH);
         int mounts = mount_over_all_copies(e->patched_path, e->name, e->package_name);
@@ -1299,6 +1490,7 @@ static void phase0_instant_mount(const char *cache_index_path) {
         }
         struct stat pst;
         if (stat(e->patched_path, &pst) != 0 || pst.st_size == 0) continue;
+        if (row_blocked(cache_index_path, e)) continue;
         int m = mount_over_all_copies(e->patched_path, e->name, e->package_name);
         logmsg("instant local-cache mount (no network): %s (%d mount(s))", e->name, m);
         /* Kill the app right after the mount (short delay inside restart_app)
@@ -1433,8 +1625,23 @@ static int process_target(const char *work_dir, const char *cache_index_path,
         return TARGET_SKIPPED;
     }
 
-    char patched_out[600];
-    derive_patched_path(base_patched_out, target_apk, patched_out, sizeof(patched_out));
+    /* Safe mode (previous boot never completed): hold back what could wedge
+       the boot. g_deferred makes run_cycle() process the config again once
+       the boot has completed and the guard is cleared. */
+    if (g_skip_level >= 2 || (g_skip_level >= 1 && is_file_type)) {
+        log_once("safe mode (level %d): deferring target %s", g_skip_level, target_apk);
+        g_deferred = 1;
+        return TARGET_SKIPPED;
+    }
+
+    /* Built into patched_final + ".tmp" and only renamed into place once it
+       has passed the sanity checks: an interrupted or rejected build must
+       never replace the file the cache (and, after a reboot, the mounts)
+       point to. patched_out is the tmp path while building and is switched
+       to patched_final after the rename. */
+    char patched_final[600], patched_out[620];
+    derive_patched_path(base_patched_out, target_apk, patched_final, sizeof(patched_final));
+    snprintf(patched_out, sizeof(patched_out), "%s.tmp", patched_final);
 
     /* We run in the global mount namespace, so once our own bind mount is
        active, target_apk resolves to our own previously patched output, not
@@ -1459,9 +1666,18 @@ static int process_target(const char *work_dir, const char *cache_index_path,
     char hit_patched_path[512] = {0};
     struct stat pst;
     if (hit && !strcmp(hit->orig, apk_hex) && !strcmp(hit->cfg, cfg_hex) && stat(hit->patched_path, &pst) == 0) {
-        use_cached_patch = 1;
-        snprintf(hit_patched_path, sizeof(hit_patched_path), "%s", hit->patched_path);
-        logmsg("target %s: apk + config unchanged, reusing cached patched APK", target_apk);
+        if (is_file_type && quarantined(hit->patched)) {
+            log_once("quarantined build %.12s (an earlier boot hung with it): not mounting %s",
+                     hit->patched, target_apk);
+            return TARGET_FAILED;
+        }
+        if (patched_file_sane(hit->patched_path, target_apk)) {
+            use_cached_patch = 1;
+            snprintf(hit_patched_path, sizeof(hit_patched_path), "%s", hit->patched_path);
+            logmsg("target %s: apk + config unchanged, reusing cached patched APK", target_apk);
+        } else {
+            logmsg("target %s: cached build is unusable, rebuilding", target_apk);
+        }
     }
 
     if (!use_cached_patch) {
@@ -1856,10 +2072,35 @@ rebuild_done:
     copy_file_attrs(target_apk, patched_out);
     {
         char patched_hex[41];
+        if (!patched_file_sane(patched_out, target_apk)) {
+            logmsg("target %s: patched build rejected, NOT mounting it (check the rules)", target_apk);
+            unlink(patched_out);
+            led_stop_patching_blink(blink_pid);
+            return TARGET_FAILED;
+        }
         if (content_fingerprint(patched_out, patched_hex) == 0) {
+            if (is_file_type && quarantined(patched_hex)) {
+                logmsg("target %s: this exact build (%.12s) hung an earlier boot, NOT mounting it",
+                       target_apk, patched_hex);
+                unlink(patched_out);
+                led_stop_patching_blink(blink_pid);
+                return TARGET_FAILED;
+            }
+            if (rename(patched_out, patched_final) != 0) {
+                logmsg("cannot move %s into place: %s", patched_out, strerror(errno));
+                unlink(patched_out);
+                led_stop_patching_blink(blink_pid);
+                return TARGET_FAILED;
+            }
+            snprintf(patched_out, sizeof(patched_out), "%s", patched_final);
             cache_index_put(cache_index_path, target_apk, package_name, apk_hex, patched_hex, cfg_hex, patched_out);
             logmsg("cache updated: %s (orig=%.12s patched=%.12s cfg=%.12s)",
                    target_apk, apk_hex, patched_hex, cfg_hex);
+        } else {
+            logmsg("cannot fingerprint patched build %s", patched_out);
+            unlink(patched_out);
+            led_stop_patching_blink(blink_pid);
+            return TARGET_FAILED;
         }
     }
     led_stop_patching_blink(blink_pid);
@@ -1916,6 +2157,12 @@ static void run_cycle(const char *work_dir, const char *cache_index_path,
            process the config again even if it's unchanged, so that target
            gets rebuilt from its new original. */
         force_process = ensure_cached_mounts(cache_index_path) > 0;
+    }
+    /* Targets held back by safe mode are processed as soon as the boot
+       guard has been cleared (boot completed). */
+    if (g_deferred && g_skip_level == 0) {
+        force_process = 1;
+        g_deferred = 0;
     }
 
     /* ---- Phase 1: fetch remote config, patch/mount/revert if it changed ---- */
@@ -2095,6 +2342,18 @@ int main(int argc, char **argv) {
     snprintf(default_patched_out, sizeof(default_patched_out), "%s/patched.apk", moddir);
     snprintf(default_config_url_file, sizeof(default_config_url_file), "%s/config_url", moddir);
 
+    /* patcher check-xml <file>: exit 0 if the file is well-formed XML. */
+    if (argc == 3 && !strcmp(argv[1], "check-xml")) {
+        long len;
+        unsigned char *data = read_whole_file(argv[2], &len);
+        if (!data) { fprintf(stderr, "cannot read %s\n", argv[2]); return 2; }
+        char err[160];
+        int ok = xml_wellformed(data, len, err, sizeof(err));
+        free(data);
+        printf(ok ? "OK\n" : "INVALID: %s\n", err);
+        return ok ? 0 : 1;
+    }
+
     /* argv[1] alone (if it's not a full positional override) is just the
        mode; every path defaults to files next to the binary itself. */
     const char *mode = "daemon";
@@ -2120,6 +2379,9 @@ int main(int argc, char **argv) {
     }
 
     snprintf(g_log_path, sizeof(g_log_path), "%s", log_path);
+    path_sibling(cache_index_path, "boot_guard", g_guard_path, sizeof(g_guard_path));
+    path_sibling(cache_index_path, "quarantine.txt", g_quar_path, sizeof(g_quar_path));
+    g_daemon_start = time(NULL);
     g_log = fopen(log_path, "a");
     log_trim_if_needed();
     crc32_init();
@@ -2178,8 +2440,12 @@ int main(int argc, char **argv) {
     state_save(state_path, &st);
 
     if (!strcmp(mode, "daemon")) {
+        int a = guard_attempts();
+        g_skip_level = a > 0 ? skip_level_for(a) : 0;
+        if (a > 0) logmsg("boot guard: boot attempt %d not completed yet, safe-mode level %d", a, g_skip_level);
         int first = 1;
         for (;;) {
+            boot_guard_tick(cache_index_path);
             run_cycle(work_dir, cache_index_path, patched_out, &st, &first);
             state_save(state_path, &st);
             int interval = st.poll_interval > 0 ? st.poll_interval : 10;
@@ -2190,6 +2456,11 @@ int main(int argc, char **argv) {
            enforces a post-fs-data time budget), so it only does the
            network-free instant-cache mount - the full fetch/rebuild
            pipeline belongs to the long-lived daemon (service.sh) instead. */
+        int attempt = guard_attempts() + 1;
+        guard_write(attempt);
+        g_skip_level = skip_level_for(attempt);
+        logmsg("boot guard: boot attempt %d, safe-mode level %d%s", attempt, g_skip_level,
+               g_skip_level ? " (the previous boot never completed)" : "");
         phase0_instant_mount(cache_index_path);
         state_save(state_path, &st);
     }
