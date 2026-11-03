@@ -1,0 +1,17 @@
+name: setup-ndk
+description: Expose an Android NDK as $NDK (runner-preinstalled, else download r27c)
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        found=$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1 || true)
+        if [ -z "$found" ]; then
+          echo "No preinstalled NDK - downloading r27c"
+          curl -fsSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          mkdir -p "$ANDROID_HOME/ndk"
+          unzip -q /tmp/ndk.zip -d "$ANDROID_HOME/ndk"
+          found=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)
+        fi
+        echo "NDK=$found" >> "$GITHUB_ENV"
+        echo "Using NDK: $found"

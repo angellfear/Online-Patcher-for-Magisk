@@ -1,0 +1,97 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # Compile check on every push to master / PR-ish push; also the first gate
+  # before a tagged release is built.
+  check:
+    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-ndk
+      - name: Compile
+        run: |
+          TOOLBIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          mkdir -p out/online_patcher/bin
+          (cd src && "$TOOLBIN/aarch64-linux-android24-clang" -O2 -Wall \
+              -o ../out/online_patcher/bin/patcher patcher.c puff.c -ldl)
+          "$TOOLBIN/llvm-strip" out/online_patcher/bin/patcher
+          ls -la out/online_patcher/bin/
+
+  # Tagged build: assemble the Magisk module zip, publish it as a GitHub
+  # release, then prune all but the newest KEEP releases (and their tags).
+  release:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      KEEP_RELEASES: '3'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-ndk
+
+      - name: Compile patcher
+        run: |
+          TOOLBIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          mkdir -p out/online_patcher/bin
+          (cd src && "$TOOLBIN/aarch64-linux-android24-clang" -O2 -Wall \
+              -o ../out/online_patcher/bin/patcher patcher.c puff.c -ldl)
+          "$TOOLBIN/llvm-strip" out/online_patcher/bin/patcher
+
+      - name: Assemble Magisk module
+        run: |
+          install -m 644 module/module.prop module/post-fs-data.sh module/service.sh \
+                         module/sepolicy.rule module/customize.sh out/online_patcher/
+          # CI checkouts never contain config_url.txt (gitignored, holds the real
+          # server URL), so the zip ships the committed placeholder - the module
+          # built from GitHub carries no personal configuration.
+          URL_FILE=config_url.txt
+          [ -f "$URL_FILE" ] || URL_FILE=config_url.txt.example
+          printf '%s' "$(tr -d '\r\n' < "$URL_FILE")" > out/online_patcher/config_url
+
+      - name: Package zip
+        run: |
+          (cd out/online_patcher && zip -r -X ../online_patcher.zip .)
+          unzip -l out/online_patcher.zip
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" out/online_patcher.zip \
+            --title "Online Patcher $TAG" \
+            --generate-notes
+
+      - name: Upload artifact (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: online_patcher
+          path: out/online_patcher.zip
+
+      - name: Prune old releases (keep newest $KEEP_RELEASES)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          keep=${KEEP_RELEASES:-3}
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
+            --jq 'sort_by(.created_at) | reverse | .[].tag_name' \
+          | awk -v keep="$keep" 'NR > keep {print}' \
+          | while read -r tag; do
+              [ -z "$tag" ] && continue
+              echo "pruning release $tag"
+              id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.id')
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" || true
+            done
