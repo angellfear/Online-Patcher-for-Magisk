@@ -6,7 +6,9 @@
 // extracts/patches/re-signs (APK v1 / JAR scheme, embedded identity) and
 // repacks APK targets, or just copies+patches plain file targets, then
 // bind-mounts the result over the original - no pm install, no separate
-// shell orchestration needed beyond one invocation at boot.
+// shell orchestration needed beyond one invocation at boot. "file_create"
+// targets instead place brand-new files (content/mode/SELinux context all
+// from the config) into the module's magic-mount tree, systemlessly.
 //
 // Caching: skips the (slow) rebuild of a target when neither its source
 // content nor its own slice of the config has changed since last run.
@@ -1253,6 +1255,23 @@ static int ensure_cached_mounts(const char *cache_index_path) {
     for (int i = 0; i < idx.count; i++) {
         const cache_entry_t *e = &idx.entries[i];
         struct stat source_st, target_st;
+
+        /* Created files have no on-disk original to fingerprint. Their
+           delivery is Magisk's own magic mount, which re-presents the
+           module-tree file at every boot (a tmpfs over the directory plus a
+           bind of the file when the path is new) - and that magic-mount copy
+           never shares stat() identity with the tree file, so any bind-mount
+           "restore" here would just stack a new mount every cycle. The tree
+           file IS the persistent state; the only thing to watch is it going
+           missing (dropped row - the config cycle recreates it). */
+        if (!strcmp(e->orig, "create")) {
+            if (stat(e->patched_path, &source_st) != 0) {
+                logmsg("created file vanished, dropping cache row: %s", e->name);
+                cache_index_remove(cache_index_path, e->name);
+                dropped++;
+            }
+            continue;
+        }
         int mounted = stat(e->patched_path, &source_st) == 0 &&
                       stat(e->name, &target_st) == 0 &&
                       source_st.st_dev == target_st.st_dev &&
@@ -1473,6 +1492,9 @@ static void phase0_instant_mount(const char *cache_index_path) {
 
     for (int i = 0; i < idx0.count; i++) {
         const cache_entry_t *e = &idx0.entries[i];
+        /* Created files are magic-mounted by Magisk itself at boot - nothing
+           to mount here, and no readable original to fingerprint either. */
+        if (!strcmp(e->orig, "create")) continue;
         umount2(e->name, MNT_DETACH);
         char hex[41];
         if (content_fingerprint(e->name, hex) != 0) {
@@ -1544,6 +1566,13 @@ static void target_content_hash(const target_config_t *t, char *hex_out) {
     sha1_update(&ctx, (const unsigned char *)t->apk_path, strlen(t->apk_path));
     sha1_update(&ctx, (const unsigned char *)t->package_name, strlen(t->package_name));
     sha1_update(&ctx, (const unsigned char *)t->type, strlen(t->type));
+    /* "create" targets carry no rules; their content/mode/context is the
+       whole target description, so it all feeds the cache key. For apk/file
+       targets these fields are empty and contribute nothing. */
+    if (t->content_hex)
+        sha1_update(&ctx, (const unsigned char *)t->content_hex, strlen(t->content_hex));
+    sha1_update(&ctx, (const unsigned char *)t->mode_str, strlen(t->mode_str));
+    sha1_update(&ctx, (const unsigned char *)t->context, strlen(t->context));
     for (int i = 0; i < t->rules.count; i++) {
         const patch_rule_t *r = &t->rules.rules[i];
         sha1_update(&ctx, (const unsigned char *)r->file_name, strlen(r->file_name));
@@ -1598,6 +1627,131 @@ static int target_package(const target_config_t *t, char *out, size_t outsz) {
     return -1;
 }
 
+/* A "file_create" target places a brand-new file - content given inline in
+   the config, there is no on-disk original to patch - into this module's
+   magic-mount tree: <moddir>/system/... or <moddir>/vendor/... Magisk
+   overlays that tree onto the real filesystem at boot, so the file appears
+   at its target path systemlessly, survives OTA flashes (which rewrite
+   /system but never touch module storage) and needs no writable /system.
+   uid:gid 0:0, the octal mode from the config (default 0644) and the
+   optional SELinux context are applied as the file is written - the label
+   carries into the magic mount, which matters for e.g. files dropped into
+   /system/etc/security/cacerts (system_security_cacerts_file). If the real
+   target path already exists anyway, the created file is additionally
+   bind-mounted over it right away, exactly like a "file_path" target.
+
+   Cache rows for created files use the literal marker "create" in the orig
+   column - never a sha1 hex, so it can't collide with a real fingerprint -
+   with the content's sha1 in the patched column and the module-tree path
+   in patched_path. Removing the target from the config reverts it: the
+   bind mount (if any) is dropped and the module-tree file is unlinked, so
+   the file is gone after the next boot. */
+static int process_create_target(const char *cache_index_path, const target_config_t *tgt) {
+    const char *target_path = tgt->apk_path;
+
+    /* Creating a brand-new /system or /vendor file is exactly the kind of
+       change that could wedge a boot, so hold it back in safe mode like
+       file targets (g_deferred re-runs it once the boot guard clears). */
+    if (g_skip_level >= 1) {
+        log_once("safe mode (level %d): deferring create target %s", g_skip_level, target_path);
+        g_deferred = 1;
+        return TARGET_SKIPPED;
+    }
+
+    const char *overlay = NULL;
+    if (!strncmp(target_path, "/system/", 8)) overlay = "/system";
+    else if (!strncmp(target_path, "/vendor/", 8)) overlay = "/vendor";
+    else {
+        logmsg("create target %s: only /system/... and /vendor/... can be created systemlessly",
+               target_path);
+        return TARGET_FAILED;
+    }
+
+    long clen;
+    unsigned char *content = hex_decode(tgt->content_hex ? tgt->content_hex : "", &clen);
+    if (!content || clen == 0) {
+        logmsg("create target %s: content_hex missing or malformed", target_path);
+        free(content);
+        return TARGET_FAILED;
+    }
+    char content_hex[41];
+    {
+        unsigned char d[20];
+        sha1_buf(content, (size_t)clen, d);
+        for (int i = 0; i < 20; i++) snprintf(content_hex + i * 2, 3, "%02x", d[i]);
+    }
+    mode_t mode = tgt->mode_str[0] ? (mode_t)strtol(tgt->mode_str, NULL, 8) : 0644;
+
+    char cfg_hex[41];
+    target_content_hash(tgt, cfg_hex);
+
+    /* The module dir is where cache_index_path (<moddir>/cache.tsv) lives. */
+    char moddir[512];
+    snprintf(moddir, sizeof(moddir), "%s", cache_index_path);
+    char *slash = strrchr(moddir, '/');
+    if (slash) *slash = 0; else snprintf(moddir, sizeof(moddir), ".");
+
+    /* "/system" and "/vendor" are both 7 chars, so the tail after either
+       prefix starts with the path's own '/'. */
+    char dest[900];
+    snprintf(dest, sizeof(dest), "%s%s%s", moddir, overlay, target_path + 7);
+
+    /* Already in place with this exact content and config: nothing to do.
+       Checked by content hash, not just the cache row, so a file deleted
+       out from under us gets rewritten on the next config cycle. */
+    {
+        cache_index_t idx;
+        cache_index_load(cache_index_path, &idx);
+        const cache_entry_t *hit = cache_index_find(&idx, target_path);
+        char cur_hex[41];
+        if (hit && !strcmp(hit->orig, "create") && !strcmp(hit->cfg, cfg_hex) &&
+            content_fingerprint(dest, cur_hex) == 0 && !strcmp(cur_hex, content_hex)) {
+            logmsg("create target %s: already in place (%ld bytes)", target_path, clen);
+            free(content);
+            return TARGET_SKIPPED;
+        }
+    }
+
+    char parent[900];
+    snprintf(parent, sizeof(parent), "%s", dest);
+    slash = strrchr(parent, '/');
+    if (slash) *slash = 0;
+    /* mkdir_p() reports EEXIST for an already-present directory (several
+       created files may share one parent) - that's success here. */
+    if (mkdir_p(parent) != 0 && errno != EEXIST) {
+        logmsg("cannot create %s: %s", parent, strerror(errno));
+        free(content);
+        return TARGET_FAILED;
+    }
+    if (write_whole_file(dest, content, clen) != 0) {
+        logmsg("cannot write %s: %s", dest, strerror(errno));
+        free(content);
+        return TARGET_FAILED;
+    }
+    free(content);
+    if (chown(dest, 0, 0) != 0)
+        logmsg("chown %s -> 0:0 failed: %s", dest, strerror(errno));
+    if (chmod(dest, mode) != 0)
+        logmsg("chmod %s -> %o failed: %s", dest, mode, strerror(errno));
+    if (tgt->context[0] && lsetxattr(dest, "security.selinux", tgt->context,
+                                     strlen(tgt->context), 0) != 0)
+        logmsg("setfilecon %s -> %s failed: %s", dest, tgt->context, strerror(errno));
+
+    cache_index_put(cache_index_path, target_path, "", "create", content_hex, cfg_hex, dest);
+
+    struct stat tst;
+    if (stat(target_path, &tst) == 0) {
+        for (int k = 0; k < 8 && umount2(target_path, MNT_DETACH) == 0; k++) {}
+        int m = mount_over_all_copies(dest, target_path, "");
+        logmsg("created file mounted over existing %s (%d mount(s))", target_path, m);
+    } else {
+        logmsg("created file: %s (%ld bytes, mode %o%s%s) -> appears after next boot (magic mount)",
+               target_path, clen, mode,
+               tgt->context[0] ? ", scontext " : "", tgt->context[0] ? tgt->context : "");
+    }
+    return TARGET_REBUILT;
+}
+
 /* Full extract/patch/sign/repack/mount pipeline for one target.
    Rebuilds only if (apk, target-content) isn't already in the cache index
    for this target; mounts either way. Returns TARGET_REBUILT when this
@@ -1619,6 +1773,11 @@ static int process_target(const char *work_dir, const char *cache_index_path,
        would risk bind-mounting this target over an unrelated app's
        base.apk if package_name was simply left unset in the config. */
     const char *package_name = tgt->package_name;
+
+    /* "file_create" targets take a wholly different path - no source file,
+       no rules, no rebuild cache of patched outputs - so dispatch them
+       before anything below assumes an on-disk original. */
+    if (!strcmp(tgt->type, "create")) return process_create_target(cache_index_path, tgt);
 
     if (tgt->rules.count == 0) {
         logmsg("target %s: no rules, nothing to do", target_apk);
@@ -2233,6 +2392,18 @@ static void run_cycle(const char *work_dir, const char *cache_index_path,
                 if (!strcmp(cfg->targets[j].apk_path, idx.entries[i].name)) { still_listed = 1; break; }
             }
             if (still_listed) continue;
+            /* Created files revert by deletion: drop any bind mount (only
+               present if the real path had come to exist) and unlink the
+               module-tree file, so magic mount stops showing it after the
+               next boot. */
+            if (!strcmp(idx.entries[i].orig, "create")) {
+                logmsg("created file %s no longer in config, removing it", idx.entries[i].name);
+                unmount_all_copies(idx.entries[i].name, idx.entries[i].package_name);
+                if (unlink(idx.entries[i].patched_path) != 0)
+                    logmsg("cannot remove %s: %s", idx.entries[i].patched_path, strerror(errno));
+                cache_index_remove(cache_index_path, idx.entries[i].name);
+                continue;
+            }
             logmsg("target %s no longer in config, reverting to original", idx.entries[i].name);
             unmount_all_copies(idx.entries[i].name, idx.entries[i].package_name);
             restart_app(idx.entries[i].package_name);

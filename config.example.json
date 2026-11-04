@@ -21,6 +21,12 @@
           "replace": "<signer signature=\"308202b8...\"><package name=\"com.example.someapp\"><seinfo value=\"example_seinfo\"/></package></signer></policy>"
         }
       ]
+    },
+    {
+      "file_create": "/system/etc/security/cacerts/2b9e2e14.0",
+      "content_hex": "2d2d2d2d2d424547494e2043455254494649434154452d2d2d2d2d",
+      "mode": "644",
+      "context": "u:object_r:system_security_cacerts_file:s0"
     }
   ]
 }

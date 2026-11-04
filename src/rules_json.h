@@ -6,6 +6,8 @@
 //       { "apk_path": "...", "package_name": "...",
 //         "exec_before": "...", "exec_after": "...",
 //         "rules": [ { "file_name": "...", "pattern": "...", "replace": "..." }, ... ] },
+//       { "file_create": "/system/etc/.../new.file", "content_hex": "...",
+//         "mode": "644", "context": "u:object_r:...:s0" },
 //       ...
 //     ]
 //   }
@@ -222,13 +224,22 @@ static const char *json_parse_rules_array(const char *p, rule_set_t *rs) {
 typedef struct {
     char apk_path[512];
     char package_name[256];
-    char type[16];      /* "apk" (default) or "file" - see process_target() */
+    char type[16];      /* "apk" (default), "file" or "create" - see process_target() */
     /* Optional root shell commands run around an actual (re)patch of this
        target - not on a cached reuse: exec_before right before the rebuild
        starts, exec_after once the patched build is mounted (before the app
        is restarted). Empty = none. */
     char exec_before[1024];
     char exec_after[1024];
+    /* "file_create" targets only (type == "create"): the new file's whole
+       content as hex (a heap string like pattern_hex - PEM/hex blobs run to
+       kilobytes), plus the mode (octal string, "644" - empty = 644) and an
+       optional SELinux context to set on the created file. Applied by
+       process_create_target() in patcher.c; rules/exec_* are ignored for
+       this target type. */
+    char *content_hex;
+    char mode_str[8];
+    char context[256];
     rule_set_t rules;
 } target_config_t;
 
@@ -260,6 +271,14 @@ static const char *json_parse_target_object(const char *p, target_config_t *t) {
         if (!strcmp(key, "rules")) {
             p = json_parse_rules_array(p, &t->rules);
             if (!p) return NULL;
+        } else if (!strcmp(key, "content_hex")) {
+            /* Heap string: the created file's content is kilobytes of hex,
+               far past the fixed 1024-byte value buffer below. */
+            char *value = NULL;
+            p = json_parse_string_dyn(p, &value);
+            if (!p) return NULL;
+            free(t->content_hex);
+            t->content_hex = value;
         } else {
             char value[1024];
             const char *after = json_parse_string(p, value, sizeof(value));
@@ -268,19 +287,28 @@ static const char *json_parse_target_object(const char *p, target_config_t *t) {
             /* Which key is used says what kind of target this is - no
                separate "type" field, no extension sniffing. "apk_path" ->
                ZIP extract/sign/repack pipeline. "file_path" -> plain
-               copy+replace+mount, no ZIP, no signing. */
+               copy+replace+mount, no ZIP, no signing. "file_create" ->
+               brand-new file placed into the module's magic-mount tree,
+               content/mode/context straight from the config. */
             if (!strcmp(key, "apk_path")) {
                 snprintf(t->apk_path, sizeof(t->apk_path), "%s", value);
                 snprintf(t->type, sizeof(t->type), "apk");
             } else if (!strcmp(key, "file_path")) {
                 snprintf(t->apk_path, sizeof(t->apk_path), "%s", value);
                 snprintf(t->type, sizeof(t->type), "file");
+            } else if (!strcmp(key, "file_create")) {
+                snprintf(t->apk_path, sizeof(t->apk_path), "%s", value);
+                snprintf(t->type, sizeof(t->type), "create");
             } else if (!strcmp(key, "package_name")) {
                 snprintf(t->package_name, sizeof(t->package_name), "%s", value);
             } else if (!strcmp(key, "exec_before")) {
                 snprintf(t->exec_before, sizeof(t->exec_before), "%s", value);
             } else if (!strcmp(key, "exec_after")) {
                 snprintf(t->exec_after, sizeof(t->exec_after), "%s", value);
+            } else if (!strcmp(key, "mode")) {
+                snprintf(t->mode_str, sizeof(t->mode_str), "%s", value);
+            } else if (!strcmp(key, "context")) {
+                snprintf(t->context, sizeof(t->context), "%s", value);
             }
         }
 
@@ -377,5 +405,7 @@ static void free_patch_config(patch_config_t *cfg) {
         cfg->targets[i].rules.rules = NULL;
         cfg->targets[i].rules.count = 0;
         cfg->targets[i].rules.cap = 0;
+        free(cfg->targets[i].content_hex);
+        cfg->targets[i].content_hex = NULL;
     }
 }
